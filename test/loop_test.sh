@@ -86,7 +86,7 @@ scenario_happy() {
 
   want "$RC" "exits 0"
   want_grep "round 1: gate clean"      "$ROOT/run.out" "the gate ran and passed"
-  want_grep "round 1: both critics PASS" "$ROOT/run.out" "both critics passed"
+  want_grep "round 1: all 3 critics PASS" "$ROOT/run.out" "all three critics passed"
   want_grep "#2 DONE"                  "$ROOT/run.out" "issue landed"
   want_no_grep "fix-"                   "$STUB_DIR/calls" "no fixer was invoked"
   [ "$(commits)" = 2 ]; want $? "exactly one commit was made"
@@ -113,11 +113,29 @@ scenario_fixround() {
   want_grep "FIX: Add a test that fails if feature.txt is empty." "$STUB_DIR/2-fix-1.stdin" \
             "the finding's fix text reached the fix prompt"
   want_grep "Do not start new work."           "$STUB_DIR/2-fix-1.stdin" "fix.md was included"
-  want_grep "round 2: both critics PASS"       "$ROOT/run.out" "round 2 re-reviewed and passed"
+  want_grep "round 2: all 3 critics PASS"      "$ROOT/run.out" "round 2 re-reviewed and passed"
   want_grep "#2 DONE"                          "$ROOT/run.out" "issue landed after the fix round"
   contains FIXROUND-ACK "$(in_head NOTES.md)"
   want $? "the fix is in the committed tree"
   [ "$(commits)" = 2 ]; want $? "the fix round did not produce a second commit"
+}
+
+# Only the test critic objects. Its findings must reach the fixer, and the two critics that passed
+# must contribute no section at all — an empty heading reads as a reviewer with nothing to say.
+scenario_testcritic() {
+  setup
+  run_loop testcritic MAX_ISSUES=1
+
+  want "$RC" "exits 0"
+  want_grep "round 1: review=PASS idiom=PASS tests=FAIL" "$ROOT/run.out" "the third critic's verdict was read"
+  want_grep "2-tests-1" "$STUB_DIR/calls" "the test critic was invoked"
+  want_grep "Blocking findings — test critic" "$STUB_DIR/2-fix-1.stdin" "its findings are attributed to it"
+  want_grep "Nothing asserts that feature.txt is non-empty." "$STUB_DIR/2-fix-1.stdin" \
+            "the test critic's finding reached the fix prompt"
+  contains "Blocking findings — correctness reviewer" "$(cat "$STUB_DIR/2-fix-1.stdin")"
+  [ $? -ne 0 ]; want $? "the passing critics contributed no empty section"
+  want_grep "round 2: all 3 critics PASS" "$ROOT/run.out" "round 2 passed unanimously"
+  want_grep "#2 DONE" "$ROOT/run.out" "issue landed after the fix round"
 }
 
 # A critic produces no parseable verdict. Fail closed: never a silent PASS.
@@ -129,7 +147,7 @@ scenario_garbage() {
   want_grep "no structured output — failing closed" "$ROOT/run.out" "the unparseable verdict failed closed"
   want_grep "did not return a verdict" "$STUB_DIR/2-fix-1.stdin" \
             "the synthesised finding reached the fixer"
-  want_grep "round 2: both critics PASS" "$ROOT/run.out" "round 2 recovered"
+  want_grep "round 2: all 3 critics PASS" "$ROOT/run.out" "round 2 recovered"
   want_grep "#2 DONE" "$ROOT/run.out" "issue landed"
 }
 
@@ -200,7 +218,7 @@ scenario_preflight() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround garbage abandon no_push preflight"
+ALL="happy fixround testcritic garbage abandon no_push preflight"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then
