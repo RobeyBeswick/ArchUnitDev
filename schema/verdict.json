@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "verdict": {
+      "enum": ["PASS", "FAIL"],
+      "description": "PASS if nothing blocking remains. FAIL if there is at least one blocking finding."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Blocking findings only. Empty when the verdict is PASS.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "file": { "type": "string", "description": "Path, or \"-\" if not file-specific." },
+          "problem": { "type": "string", "description": "What is wrong, in one sentence." },
+          "fix": { "type": "string", "description": "The concrete change that would resolve it." }
+        },
+        "required": ["file", "problem", "fix"]
+      }
+    }
+  },
+  "required": ["verdict", "findings"]
+}
