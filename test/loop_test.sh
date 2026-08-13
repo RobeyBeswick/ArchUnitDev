@@ -169,9 +169,9 @@ scenario_abandon() {
   git -C "$ROOT/origin.git" rev-parse --verify --quiet abandoned/issue-2 >/dev/null
   want $? "the parked branch was pushed"
   [ "$(git -C "$REPO" rev-parse HEAD)" = "$BASE" ]; want $? "the repo was reset to the base commit"
-  [ -f "$REPO/feature.txt" ] && bad "the abandoned work is still in the working tree" \
-                             || ok "the working tree is clean of the abandoned work"
-  git -C "$REPO" show "abandoned/issue-2:feature.txt" >/dev/null 2>&1
+  [ -f "$REPO/feature-2.txt" ] && bad "the abandoned work is still in the working tree" \
+                               || ok "the working tree is clean of the abandoned work"
+  git -C "$REPO" show "abandoned/issue-2:feature-2.txt" >/dev/null 2>&1
   want $? "the abandoned work survives on the branch"
 
   want_grep "2" "$LOGS/skipped" "the issue was added to the skip list"
@@ -191,6 +191,44 @@ scenario_no_push() {
   want_grep "leaving the issue open"   "$ROOT/run.out" "the issue was left open"
   [ "$(commits)" = 2 ]; want $? "the commit was still made locally"
   [ -f "$STUB_DIR/closed" ] && bad "an issue was closed despite NO_PUSH" || ok "no issue was closed"
+  [ "$(git -C "$ROOT/origin.git" rev-list --count main)" = 1 ]; want $? "origin was not advanced"
+}
+
+# Two issues in one run. Everything about the queue that a one-issue run cannot show: that it
+# advances, that the second issue's base is the first issue's commit rather than the original HEAD,
+# and that each issue is implemented exactly once.
+#
+# Under NO_PUSH specifically, because that is where advancing is not free: an issue normally leaves
+# the queue by being closed, and NO_PUSH does not close it, so without the landed list the loop
+# re-serves the issue it just finished.
+scenario_two_issues() {
+  setup
+  printf '2\n3\n' > "$STUB_DIR/open-issues"
+  run_loop happy MAX_ISSUES=2 NO_PUSH=1
+
+  want "$RC" "exits 0"
+  want_grep "=== issue #2" "$ROOT/run.out" "the first issue was picked up"
+  want_grep "=== issue #3" "$ROOT/run.out" "the second issue was picked up"
+  want_grep "hit MAX_ISSUES=2" "$ROOT/run.out" "the run stopped at the limit rather than looping"
+  want_grep "2 issue(s) landed" "$ROOT/run.out" "both issues are counted as landed"
+  want_no_grep "empty diff" "$ROOT/run.out" "neither issue was served to the implementer twice"
+  want_no_grep "ABANDONED" "$ROOT/run.out" "nothing was abandoned"
+
+  [ "$(grep -c -- '-implement' "$STUB_DIR/calls")" = 2 ]; want $? "exactly one implement per issue"
+  [ "$(commits)" = 3 ]; want $? "one commit per issue, on top of each other"
+  contains "Closes #3" "$(git -C "$REPO" log -1 --format=%B)"
+  want $? "the second commit closes the second issue"
+  contains "Closes #2" "$(git -C "$REPO" log -1 --format=%B HEAD~1)"
+  want $? "the first commit closes the first issue"
+
+  # The base moved. If it had not, #3's diff would carry #2's file as well as its own, and every
+  # critic would spend the run re-reviewing work that was already approved.
+  want_grep "feature-3.txt" "$LOGS/3-diff-1.patch" "#3's diff contains its own work"
+  want_no_grep "feature-2.txt" "$LOGS/3-diff-1.patch" "#3's diff is against #2's commit, not the run's start"
+
+  want_grep "2" "$LOGS/landed" "the landed list records the first issue"
+  want_grep "3" "$LOGS/landed" "the landed list records the second issue"
+  [ -f "$STUB_DIR/closed" ] && bad "an issue was closed despite NO_PUSH" || ok "neither issue was closed"
   [ "$(git -C "$ROOT/origin.git" rev-list --count main)" = 1 ]; want $? "origin was not advanced"
 }
 
@@ -218,7 +256,7 @@ scenario_preflight() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon no_push preflight"
+ALL="happy fixround testcritic garbage abandon no_push two_issues preflight"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then

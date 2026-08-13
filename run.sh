@@ -31,10 +31,11 @@ MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-400000}"
 NO_PUSH="${NO_PUSH:-}"              # set to 1 to commit locally but not push or close issues
 
 SCHEMA="$(cat "$HARNESS/schema/verdict.json")"
-SKIPPED="$LOGS/skipped"
+SKIPPED="$LOGS/skipped"          # abandoned: got no further after MAX_ROUNDS, needs a human
+LANDED="$LOGS/landed"            # landed but deliberately left open, which only NO_PUSH does
 
 mkdir -p "$LOGS"
-touch "$SKIPPED"
+touch "$SKIPPED" "$LANDED"
 
 say() { printf '%s  %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$LOGS/run.log"; }
 die() { say "FATAL: $*"; exit 1; }
@@ -188,11 +189,20 @@ while :; do
   [ "$MAX_ISSUES" -gt 0 ] && [ "$done_count" -ge "$MAX_ISSUES" ] && { say "hit MAX_ISSUES=$MAX_ISSUES"; break; }
 
   # The queue: open issues, lowest number first (the issues are numbered in dependency
-  # order), minus any this run already gave up on.
-  # (the skip list is read in BEGIN rather than as a first file argument: the NR==FNR
-  #  idiom silently swallows the whole queue when the skip file is empty)
+  # order), minus the ones this run gave up on and the ones it landed without closing.
+  #
+  # That second exclusion is what makes NO_PUSH work for more than one issue. Normally an issue
+  # leaves the queue by being closed, so the queue needs no memory of success; under NO_PUSH
+  # nothing remote changes, so a landed issue is indistinguishable from an untouched one and the
+  # next iteration hands the implementer the issue it has just finished — which then produces an
+  # empty diff and gets abandoned. Both lists persist in LOGS on purpose: re-running after a
+  # NO_PUSH night continues the queue instead of redoing the commits already on your local main.
+  # (the lists are read in BEGIN rather than as leading file arguments: the NR==FNR idiom
+  #  silently swallows the whole queue when the first file is empty)
   N=$(gh issue list --state open --limit 300 --json number --jq '[.[].number] | sort | .[]' \
-      | awk -v sf="$SKIPPED" 'BEGIN { while ((getline l < sf) > 0) skip[l] } !($0 in skip)' \
+      | awk -v sf="$SKIPPED" -v lf="$LANDED" \
+          'BEGIN { while ((getline l < sf) > 0) skip[l]
+                   while ((getline l < lf) > 0) skip[l] } !($0 in skip)' \
       | head -1)
   [ -n "$N" ] || { say "no open issues left — done"; break; }
 
@@ -294,7 +304,9 @@ while :; do
       fi
     fi
     if [ -n "$NO_PUSH" ]; then
-      say "#$N NO_PUSH set, leaving the issue open"
+      # Recorded so the queue moves on: see the comment on LANDED above.
+      echo "$N" >> "$LANDED"
+      say "#$N NO_PUSH set, leaving the issue open and recording it in $(basename "$LANDED")"
     else
       gh issue close "$N" --comment "Implemented by the ArchUnitDev loop; all ${#CRITICS[@]} reviewers passed." >/dev/null \
         || say "WARNING: could not close #$N"
