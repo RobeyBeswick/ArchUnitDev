@@ -80,6 +80,16 @@ That note is the only record a human will see. A reviewer will block undocumente
 
 - **Do not run `git commit`, `git push`, or any `gh` command.** The harness owns the commit and closes
   the issue. Just leave your work in the working tree.
+- **If a dependency cannot be fetched, stop rather than route around it.** The module proxy is not
+  always reachable from the machine this runs on, and `go get` then fails after a long DNS timeout.
+  A missing third-party module is an environment problem, and hand-rolling a substitute for it is a
+  large architectural decision made for a bad reason — one that a reviewer will read as your
+  considered design and that a human would have solved by fetching the module. So: do not retry the
+  download in a loop, do not vendor a copy by hand, and do not replace it with a home-made version
+  of the same thing. Implement whatever part of the issue does not need it, leave the rest undone,
+  and write a `WHY:` note in `NOTES.md` naming the exact module and the command that would install
+  it. An issue that lands half-done with the blocker named is worth far more than one that lands
+  whole around a workaround nobody asked for.
 - **Do not weaken the checks to get them passing.** Deleting a test, adding `t.Skip`, loosening an
   assertion or commenting out a call to make the build go green will be caught and rejected. If you
   cannot make something pass, leave it failing and say so in `NOTES.md`.
