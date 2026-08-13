@@ -25,6 +25,7 @@ cat > "$STUB_DIR/$tag.stdin"
 printf '%s\n' "$tag" >> "$STUB_DIR/calls"
 
 round="${tag##*-}"   # meaningless for "*-implement", unused there
+issue="${tag%%-*}"
 
 result() {
   jq -n --arg r "$1" '{
@@ -51,8 +52,11 @@ verdict_fail() {
 
 case "$tag" in
   *-implement)
-    printf 'a feature, implemented by the stub\n' > feature.txt
-    result "Added feature.txt."
+    # One file per issue, not one file for the run: with a fixed name and fixed contents a second
+    # issue rewrites byte-identical content, run.sh sees an empty diff, and the two-issue scenario
+    # would report a queue bug it does not have (or hide one it does).
+    printf 'a feature for issue %s, implemented by the stub\n' "$issue" > "feature-$issue.txt"
+    result "Added feature-$issue.txt."
     ;;
 
   *-fix-*)
@@ -68,7 +72,7 @@ case "$tag" in
       fixround)
         if grep -q FIXROUND-ACK NOTES.md 2>/dev/null
           then verdict_pass
-          else verdict_fail feature.txt \
+          else verdict_fail "feature-$issue.txt" \
                  "feature.txt is asserted by no test." \
                  "Add a test that fails if feature.txt is empty."
         fi ;;
@@ -80,7 +84,7 @@ case "$tag" in
           else verdict_pass
         fi ;;
       always_fail)
-        verdict_fail feature.txt "Still not right." "Try again." ;;
+        verdict_fail "feature-$issue.txt" "Still not right." "Try again." ;;
       *) echo "stub claude: unknown SCENARIO $SCENARIO" >&2; exit 64 ;;
     esac
     ;;
