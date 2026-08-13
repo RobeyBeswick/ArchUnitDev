@@ -47,7 +47,15 @@ are all expressed there. Rule 4 (*nothing imports the root package*) is the one 
 cannot express, because it matches path prefixes and the public surface's path is the module path
 itself, so the idiom critic owns that one by hand.
 
-Two consequences, both handled in preflight rather than discovered in the morning: a missing
+**Preflight's job is the failures that do not announce themselves.** A blocked module proxy is the
+clearest example, because of *how* it fails: `go get` on an unreachable proxy does not error, it hangs
+past 30 seconds with no output, so the implementer spends its wall clock waiting, gets killed by
+`TIMEOUT`, and hands back an unfinished issue with nothing in the log pointing at DNS — and then does
+it again for every issue after that. One 15-second read-only `go list -m` at startup turns that into a
+line naming the cause and the fix. It warns rather than dying, because most issues add no dependency
+and killing a night's run over a proxy nothing in the queue needs would cost more than it saves.
+
+Two more consequences, both handled in preflight rather than discovered in the morning: a missing
 `golangci-lint` binary and a missing `.golangci.yml` are **fatal**, not warnings. Either one makes the
 gate go green while checking a fraction of what it claims to — golangci-lint with no config silently
 falls back to five default linters. `ALLOW_NO_LINT=1` overrides both and drops back to the grep
@@ -161,11 +169,35 @@ $AWS_CREDS_CMD | tr ' ' '\n' > /tmp/aws.env
 ```
 
 Egress needed: `bedrock-runtime.*.amazonaws.com` (the pinned model is a *global* inference profile, so
-it may route across regions), `github.com` and `api.github.com` for `gh`, and
-`proxy.golang.org` + `sum.golang.org` — the extractor depends on `golang.org/x/tools`, so `go build`
-inside the gate will fetch modules. The image build additionally needs
-`raw.githubusercontent.com` and `objects.githubusercontent.com` for the `golangci-lint` installer,
-though not at run time. Notably **not** `api.anthropic.com`.
+it may route across regions), `github.com` and `api.github.com` for `gh`, and somewhere to resolve Go
+modules from — the extractor depends on `golang.org/x/tools`, so `go build` inside the gate needs it.
+Which host that is depends on `GOPROXY`:
+
+| `GOPROXY` | Needs |
+|---|---|
+| default | `proxy.golang.org` + `sum.golang.org` |
+| `direct` | the VCS host of every dependency — `go.googlesource.com` for `x/tools` — plus `sum.golang.org` |
+
+The default is the narrower and faster of the two, which is why the image does not change it. Use
+`direct` (`-e GOPROXY=direct`) only where `proxy.golang.org` is blocked, and note that its egress set
+is open-ended: it is wherever the dependencies happen to be hosted, so it cannot be pinned in a policy
+the way one proxy hostname can.
+
+The image build warms the module cache for `golang.org/x/tools`, so the first gate run does not spend
+the implementer's wall clock fetching it. That reduces the module traffic but **does not remove the
+need for it**, and the reason is worth knowing before you write an egress policy that assumes
+otherwise: what a warm cache cannot answer is *version resolution*. Adding a new import and running
+`go get golang.org/x/tools@latest` or `go mod tidy` asks "which version is latest", which is a network
+lookup with no cache fallback — verified: it fails under `GOPROXY=off` against a fully populated cache.
+Only once the version is pinned in `go.mod` is the whole build satisfiable offline, and then it needs
+a `go mod tidy` too, because `go get module@version` records no checksums for the module's own
+dependencies. So `go build` on a settled `go.mod` is offline-capable; the commit that first adds the
+dependency is not.
+
+The image build additionally needs `raw.githubusercontent.com` and `objects.githubusercontent.com` for
+the `golangci-lint` installer, plus whatever `GOPROXY` resolves to for the cache warm — pass
+`--build-arg GOPROXY=direct` if the build host is the blocked one. Neither is needed at run time.
+Notably **not** `api.anthropic.com`.
 
 A `GH_TOKEN` with `repo` scope is required regardless — the loop reads, comments on and closes issues,
 and pushes commits.
@@ -223,6 +255,11 @@ only happens under `NO_PUSH`. Both are excluded from the queue. Delete them to m
 reconsider an issue — and delete `landed` if you throw away the local commits it refers to,
 or the queue will skip work that is no longer there.
 
+`landed` is pruned at startup of any entry whose issue is no longer open, and that is not tidiness.
+Reopening an issue is how a human says the work was not good enough; a permanent skip entry would make
+that reopened issue invisible to the queue for ever, with the run cheerfully reporting an empty backlog.
+An entry for an issue that is still open is left alone, which is the case the file exists for.
+
 ## Knobs
 
 All environment variables, all with defaults that work:
@@ -242,6 +279,7 @@ All environment variables, all with defaults that work:
 | `LINT` | `golangci-lint` | The linter binary. Only worth setting to test the fallback path. |
 | `ALLOW_NO_LINT` | unset | Run a Go repo without `golangci-lint` or without a `.golangci.yml`. Downgrades the architecture rules to greps. Do not use for an unattended run. |
 | `ALLOW_STATIC_CREDS` | unset | Permit an unbounded run on static temporary credentials, which will expire partway through the night. |
+| `SKIP_MODULE_CHECK` | unset | Skip the preflight module-resolution probe. Worth setting only for an air-gapped run against a settled `go.mod`, where the warning is accurate but not actionable. |
 
 Work up in three steps rather than trusting a fresh container with a night:
 
@@ -272,6 +310,8 @@ machinery. The scenarios are:
 | `no_push` | `NO_PUSH=1` commits locally and touches nothing remote. |
 | `two_issues` | Two issues in one run: the queue advances, the second issue's base is the first one's commit, and each issue is implemented exactly once. |
 | `preflight` | A Go repo with no `.golangci.yml`, and a missing linter binary, are both fatal — and `ALLOW_NO_LINT=1` overrides both. |
+| `moduleproxy` | An unresolvable module proxy warns and carries on rather than killing the run, names `GOPROXY=direct` as the fix, and the probe stays read-only. |
+| `relative_logs` | A relative `LOGS` — the invocation this README documents — still logs to the right place after the script cds into the target repo, and writes nothing into that repo. |
 
 ```bash
 ./test/loop_test.sh                 # all of them

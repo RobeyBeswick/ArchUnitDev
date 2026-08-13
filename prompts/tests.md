@@ -84,7 +84,13 @@ Note what is *not* enforced: there is **no coverage threshold**. Do not report a
 - **Only `err != nil` checked**, where the returned value is the actual subject.
 - **A tautology.** `want` is computed by the same function under test, or by calling its inverse, so
   the assertion holds for any implementation. Comparing `String()` output against a string the test
-  built from the same fields is the common form here.
+  built from the same fields is the common form. The form that got past this reviewer on issue #7 is
+  quieter: a defaults test asserting `slices.Equal(resolved.ExcludedFolders, DefaultExcludedFolders())`
+  where the implementation *assigns* that field from `DefaultExcludedFolders()`. Deleting an entry from
+  the default list changes both sides of the comparison identically, so the test passes and the
+  documented default set is protected by nothing. Whenever a test compares against a **call** rather
+  than a literal, ask what the implementation assigns from; if it is the same call, the fix is to write
+  the expected value out in full.
 - **An empty or absent `want`** in a table row, so the case asserts the zero value and would pass if
   the function returned nothing.
 - **`t.Log` where `t.Error` was meant.** The test reports the defect into a log nobody reads and exits

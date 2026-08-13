@@ -1,0 +1,14 @@
+# `COPY . /harness` would otherwise bake the build host's own run logs into the image. They are
+# git-ignored but not Docker-ignored, they grow without bound across nights, and every write to one
+# invalidates the COPY layer and everything after it.
+logs/
+*.debug.log
+
+# Nothing in the image reads the harness's history, and it changes on every commit.
+.git/
+.gitignore
+
+# Local scratch that must never end up in a runner image.
+.DS_Store
+*.env
+*.env.*
