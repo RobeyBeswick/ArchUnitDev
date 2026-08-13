@@ -42,6 +42,38 @@ RUN git config --global user.name  "ArchUnitDev loop" \
  && git config --global user.email "loop@archunitdev.invalid" \
  && git config --global --add safe.directory /work/repo
 
+# GOPATH moves under $HOME because the module cache has to be writable by dev — later issues add
+# dependencies. /go in the base image is root-owned; setting this is cheaper than chowning it.
+ENV GOPATH=/home/dev/go
+
+# Warm the module cache for golang.org/x/tools, which the extractor needs for go/packages and which
+# is the only third-party module the target repo takes. Worth the ~110MB (27MB of modules, 86MB of
+# compiled objects): otherwise every fresh container fetches and compiles it inside the implementer's
+# wall clock on the first gate run, and on a network where the module proxy is unreachable it cannot
+# fetch it at all.
+#
+# The version is a cache key, not a constraint. If the target repo resolves a different one, go
+# fetches that and this layer goes unused — a stale value here is harmless, never wrong.
+#
+# Compiling is the point, not downloading. `go mod download golang.org/x/tools@VERSION` fetches that
+# module alone and leaves x/mod and x/sync to be fetched at run time; building something that
+# imports go/packages resolves the whole graph and populates the build cache the gate reuses.
+#
+# GOPROXY is a build arg so the image can be built on a network where proxy.golang.org does not
+# resolve — `docker build --build-arg GOPROXY=direct .`, which needs egress to go.googlesource.com.
+# It is deliberately not an ENV: at run time the default proxy is the faster and narrower choice,
+# and an operator who needs otherwise can pass `-e GOPROXY=direct`.
+ARG GOPROXY=https://proxy.golang.org,direct
+ARG XTOOLS_VERSION=v0.49.0
+RUN mkdir -p /tmp/warm && cd /tmp/warm \
+    && go mod init warm \
+    && printf 'package warm\n\nimport _ "golang.org/x/tools/go/packages"\n' > warm.go \
+    && go mod edit -require="golang.org/x/tools@${XTOOLS_VERSION}" \
+    && go mod tidy \
+    && go build ./... \
+    && cd / && rm -rf /tmp/warm \
+    && go env GOMODCACHE && du -sh "$(go env GOMODCACHE)"
+
 COPY --chown=dev:dev . /harness
 WORKDIR /harness
 

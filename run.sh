@@ -16,6 +16,16 @@ HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-/work/repo}"
 LOGS="${LOGS:-$HARNESS/logs}"
 
+# Absolute from here on, before anything derives a path from either. This script cds into the target
+# repo to do its work, so a *relative* LOGS — which is exactly what the documented
+# `LOGS=./logs ./run.sh` gives you — silently repoints everything at the target repo at that moment:
+# `tee` fails on every line of narration, the skipped and landed lists read as absent so the queue
+# forgets what it has already done, and any log that did get written would land inside the repository
+# the loop then commits with `git add -A`.
+mkdir -p "$LOGS" 2>/dev/null || { echo "FATAL: cannot create LOGS=$LOGS" >&2; exit 1; }
+LOGS="$(cd "$LOGS" && pwd)"
+[ -d "$REPO" ] && REPO="$(cd "$REPO" && pwd)"
+
 MAX_ROUNDS="${MAX_ROUNDS:-3}"       # review/fix rounds before an issue is abandoned
 # The critics, each backed by prompts/<role>.md. They run concurrently and every one must PASS.
 # Adding a role here and a prompt file is the whole of adding a reviewer.
@@ -35,7 +45,6 @@ SCHEMA="$(cat "$HARNESS/schema/verdict.json")"
 SKIPPED="$LOGS/skipped"          # abandoned: got no further after MAX_ROUNDS, needs a human
 LANDED="$LOGS/landed"            # landed but deliberately left open, which only NO_PUSH does
 
-mkdir -p "$LOGS"
 touch "$SKIPPED" "$LANDED"
 
 say() { printf '%s  %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$LOGS/run.log"; }
@@ -53,10 +62,10 @@ command -v go     >/dev/null || say "WARNING: go not on PATH — the build and t
 # `timeout` is coreutils: it is in the image, but not on a stock macOS box, where it is `gtimeout`
 # or absent entirely. Resolve it once here — otherwise every invocation dies on "command not found"
 # and the run burns the whole queue doing nothing.
-if   command -v timeout  >/dev/null 2>&1; then TIMEOUT_CMD=(timeout "$TIMEOUT")
-elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD=(gtimeout "$TIMEOUT")
+if   command -v timeout  >/dev/null 2>&1; then TIMEOUT_CMD=(timeout "$TIMEOUT");  TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD=(gtimeout "$TIMEOUT"); TIMEOUT_BIN=gtimeout
 else
-  TIMEOUT_CMD=()
+  TIMEOUT_CMD=(); TIMEOUT_BIN=
   say "WARNING: neither timeout nor gtimeout is on PATH — invocations will run with no wall-clock limit and TIMEOUT=$TIMEOUT is ignored. A wedged invocation will hang the run. Install coreutils."
 fi
 [ -d "$REPO/.git" ] || die "$REPO is not a git repository (mount the target repo there, or set REPO)"
@@ -70,6 +79,30 @@ if [ -f "$REPO/go.mod" ] && [ -z "${ALLOW_NO_LINT:-}" ]; then
     || die "${LINT:-golangci-lint} is not installed, so the gate cannot enforce the architecture rules in $REPO/.golangci.yml. Install golangci-lint >= v2.5.0, or set ALLOW_NO_LINT=1 to run with grep fallbacks and no lint enforcement."
   [ -f "$REPO/.golangci.yml" ] || [ -f "$REPO/.golangci.yaml" ] || [ -f "$REPO/.golangci.toml" ] \
     || die "no .golangci.yml in $REPO — golangci-lint would silently fall back to its five default linters and none of the dependency rules would be checked. Restore the config, or set ALLOW_NO_LINT=1."
+fi
+
+# Can this machine resolve a module version? That is a different question from whether the module
+# cache is warm, and a warm cache does not answer it: adding a dependency needs a *version lookup*
+# ("which version is @latest"), which has no cache fallback at all. A build against a settled go.mod
+# works offline; the commit that first adds the dependency does not.
+#
+# It is worth 15 seconds here because of how it fails rather than whether it does. A blocked module
+# proxy does not error, it hangs — measured at over 30s with no output and no rc — so the implementer
+# spends its wall clock waiting, gets killed by TIMEOUT, and the issue comes back as unfinished work
+# with nothing in the log pointing at DNS. The queue then does the same thing to every issue after it.
+#
+# A warning, not fatal: most issues add no dependency, and killing a night's run over a proxy that
+# nothing in the queue needs would cost more than the failure it prevents. golang.org/x/tools is the
+# module probed because it is the one this backlog actually reaches for — the extractor needs
+# go/packages — so a failure here is a real blocker for a real issue rather than a synthetic one.
+if [ -f "$REPO/go.mod" ] && command -v go >/dev/null 2>&1 && [ -z "${SKIP_MODULE_CHECK:-}" ]; then
+  probe=()
+  [ -n "$TIMEOUT_BIN" ] && probe=("$TIMEOUT_BIN" 15)
+  # Run outside the repo: the probe must not be able to touch its go.mod or go.sum.
+  probe_dir="${TMPDIR:-/tmp}"
+  if ! (cd "$probe_dir" && ${probe[@]+"${probe[@]}"} go list -m -json golang.org/x/tools@latest) >/dev/null 2>&1; then
+    say "WARNING: cannot resolve module versions — 'go list -m golang.org/x/tools@latest' failed or timed out. Any issue that adds a dependency will hang until TIMEOUT and come back unfinished. If proxy.golang.org is blocked here, GOPROXY=direct fetches straight from the VCS host (needs egress to go.googlesource.com). Issues that add no dependency are unaffected. Set SKIP_MODULE_CHECK=1 to silence this."
+  fi
 fi
 
 # Auth. Three ways in; check the one actually configured, and fail now rather than on
@@ -102,6 +135,35 @@ cd "$REPO" || die "cannot cd to $REPO"
 gh auth status >/dev/null 2>&1 || die "gh is not authenticated (set GH_TOKEN)"
 git config user.email >/dev/null 2>&1 || die "git user.email is not configured in the container"
 git remote get-url origin >/dev/null 2>&1 || die "no git remote named origin"
+
+# Prune the landed list of issues that are no longer open. An entry there means only "work exists for
+# this issue which the issue itself does not yet reflect", and a closed issue reflects it — so the
+# entry has served its purpose and keeping it is actively harmful. Reopening an issue is how a human
+# says the work was not good enough, and a permanent skip entry would make that reopened issue
+# invisible to the queue for ever, silently, with the run reporting an empty backlog.
+#
+# Left alone otherwise: an entry for an issue that is still open is the whole point of the file, and it
+# is what stops a NO_PUSH run implementing the same issue on every iteration.
+#
+# Both awks below read the reference file with getline rather than the usual NR==FNR two-file trick,
+# and that is not a style choice. NR==FNR is true for *every* line of the second file when the first
+# one is empty, so the "which entries went" version reported nothing precisely when everything was
+# pruned — the file was emptied correctly and silently. An empty reference file is not an edge case
+# here: it is a queue with no open issues left, which is where this loop is trying to get to.
+if [ -s "$LANDED" ]; then
+  open_list="$LOGS/.landed-prune.$$"
+  if gh issue list --state open --limit 300 --json number --jq '.[].number' > "$open_list" 2>/dev/null; then
+    awk -v openfile="$open_list" \
+        'BEGIN { while ((getline l < openfile) > 0) open[l] } ($0 in open)' \
+        "$LANDED" > "$LANDED.tmp"
+    removed=$(awk -v keepfile="$LANDED.tmp" \
+        'BEGIN { while ((getline l < keepfile) > 0) keep[l] } !($0 in keep)' \
+        "$LANDED" | tr '\n' ' ')
+    mv "$LANDED.tmp" "$LANDED"
+    [ -n "$removed" ] && say "landed list: pruned issue(s) no longer open: $removed"
+  fi
+  rm -f "$open_list"
+fi
 
 say "harness $HARNESS -> repo $REPO ($(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD))"
 say "model $MODEL (fallback $FALLBACK_MODEL), $MAX_ROUNDS rounds/issue, $TIMEOUT per invocation, no spend cap"

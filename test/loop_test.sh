@@ -51,6 +51,10 @@ setup() {
   # One open issue. The repo has no go.mod, so gate.sh skips the Go toolchain and runs only the
   # reward-hacking guards: this test is about the harness, not about golangci-lint.
   printf '2\n' > "$STUB_DIR/open-issues"
+
+  # Where run.sh is invoked from. It only matters for a relative LOGS, but it has to be reset per
+  # scenario or one scenario's cwd leaks into the next.
+  RUN_CWD=""
 }
 
 teardown() {
@@ -61,12 +65,14 @@ teardown() {
 # run_loop <scenario> [VAR=VAL ...]  -> exit status in RC, output in $ROOT/run.out
 run_loop() {
   local scenario="$1"; shift
-  PATH="$STUBS:$PATH" \
-  env -u CLAUDE_CODE_USE_BEDROCK -u AWS_PROFILE -u AWS_SESSION_TOKEN \
-      ANTHROPIC_API_KEY=stub-key-not-used \
-      SCENARIO="$scenario" STUB_DIR="$STUB_DIR" REPO="$REPO" LOGS="$LOGS" \
-      "$@" \
-      "$HARNESS/run.sh" > "$ROOT/run.out" 2>&1
+  ( cd "${RUN_CWD:-.}" || exit 1
+    PATH="$STUBS:$PATH" \
+    env -u CLAUDE_CODE_USE_BEDROCK -u AWS_PROFILE -u AWS_SESSION_TOKEN \
+        ANTHROPIC_API_KEY=stub-key-not-used \
+        SCENARIO="$scenario" STUB_DIR="$STUB_DIR" REPO="$REPO" LOGS="$LOGS" \
+        SKIP_MODULE_CHECK=1 \
+        "$@" \
+        "$HARNESS/run.sh" ) > "$ROOT/run.out" 2>&1
   RC=$?
 }
 
@@ -228,6 +234,29 @@ scenario_two_issues() {
 
   want_grep "2" "$LOGS/landed" "the landed list records the first issue"
   want_grep "3" "$LOGS/landed" "the landed list records the second issue"
+
+  # Both issues are still open, so both entries must survive a second run — that is what stops a
+  # NO_PUSH run re-implementing them. Only a *closed* issue's entry is pruned.
+  run_loop happy MAX_ISSUES=1 NO_PUSH=1
+  want_grep "2" "$LOGS/landed" "an entry for a still-open issue survives the next run"
+  want_grep "no open issues left" "$ROOT/run.out" "and the queue stays empty rather than re-serving it"
+
+  # ...whereas an issue that is no longer open has an entry that can only do harm: reopening an issue
+  # is how a human says the work was not good enough, and a permanent skip would hide it for ever.
+  printf '3\n' > "$STUB_DIR/open-issues"
+  run_loop happy MAX_ISSUES=0 NO_PUSH=1
+  want_grep "pruned issue(s) no longer open: 2" "$ROOT/run.out" "a closed issue's entry is pruned"
+  want_no_grep "2" "$LOGS/landed" "and is gone from the file"
+  want_grep "3" "$LOGS/landed" "while the still-open issue's entry stays"
+
+  # And the case where EVERY entry goes, which is its own test because the obvious awk for "which
+  # entries went" — NR==FNR across two files — reports nothing when the first file is empty. That
+  # pruned the file correctly and said nothing, and an empty open-issue list is not exotic: it is the
+  # state this loop is working towards.
+  : > "$STUB_DIR/open-issues"
+  run_loop happy MAX_ISSUES=0 NO_PUSH=1
+  want_grep "pruned issue(s) no longer open: 3" "$ROOT/run.out" "the last entry is named when every entry goes"
+  [ ! -s "$LOGS/landed" ]; want $? "and the file is left empty"
   [ -f "$STUB_DIR/closed" ] && bad "an issue was closed despite NO_PUSH" || ok "neither issue was closed"
   [ "$(git -C "$ROOT/origin.git" rev-list --count main)" = 1 ]; want $? "origin was not advanced"
 }
@@ -293,9 +322,65 @@ scenario_preflight() {
   want_grep "everything checks out" "$ROOT/run.out" "and preflight otherwise passes"
 }
 
+# The module-resolution probe. This is the one preflight check that must NOT be fatal — most issues
+# add no dependency — so the test is as much about it staying a warning as about it firing at all.
+scenario_moduleproxy() {
+  setup
+  if ! command -v go >/dev/null 2>&1; then
+    ok "skipped: no go on PATH, so the probe cannot run (it is guarded on the same condition)"
+    return
+  fi
+  printf 'module example.invalid/x\n\ngo 1.24\n' > "$REPO/go.mod"
+  printf 'version: "2"\n' > "$REPO/.golangci.yml"
+  git -C "$REPO" add -A && git -C "$REPO" commit -q -m "add go.mod"
+
+  # An unroutable proxy rather than an unresolvable hostname: connection-refused is instant and needs
+  # no network at all, where a DNS black hole would make this test take as long as the real failure.
+  run_loop happy PREFLIGHT_ONLY=1 SKIP_MODULE_CHECK= GOPROXY=http://127.0.0.1:1
+  want "$RC" "an unresolvable module proxy is a warning, not fatal"
+  want_grep "cannot resolve module versions" "$ROOT/run.out" "and the warning says what failed"
+  want_grep "GOPROXY=direct" "$ROOT/run.out" "and names the fix"
+  want_grep "hang until TIMEOUT" "$ROOT/run.out" "and says what it would otherwise cost"
+  want_grep "everything checks out" "$ROOT/run.out" "and the rest of preflight still runs"
+
+  run_loop happy PREFLIGHT_ONLY=1 GOPROXY=http://127.0.0.1:1
+  want "$RC" "SKIP_MODULE_CHECK=1 still passes preflight"
+  want_no_grep "cannot resolve module versions" "$ROOT/run.out" "SKIP_MODULE_CHECK=1 silences the probe"
+
+  # The probe must stay read-only, and this is asserted on the command rather than on its effect
+  # deliberately. `go get` is the obvious command to reach for here and it rewrites go.mod and go.sum
+  # in whatever module it runs in — but no test of the failing path can demonstrate that, because a
+  # fetch that fails writes nothing. An assertion on the tree would pass either way: decoration.
+  probe_cmd=$(grep -F 'golang.org/x/tools@latest' "$HARNESS/run.sh" | grep -F 'cd "$probe_dir"')
+  contains "go list -m" "$probe_cmd"; want $? "the probe uses a read-only go subcommand, not go get"
+  [ -z "$(git -C "$REPO" status --porcelain)" ]; want $? "and the target repo is clean afterwards"
+}
+
+# A relative LOGS, which is what the README's own non-Docker invocation passes. run.sh cds into the
+# target repo to work, so every path derived from LOGS has to be absolute before that — otherwise the
+# narration, the state files and the per-invocation logs all quietly repoint into the target repo.
+#
+# Every other scenario passes an absolute LOGS, which is exactly why none of them caught this.
+scenario_relative_logs() {
+  setup
+  RUN_CWD="$ROOT"
+  run_loop happy MAX_ISSUES=1 LOGS=logs
+
+  want "$RC" "exits 0"
+  want_no_grep "No such file or directory" "$ROOT/run.out" "nothing failed to write"
+  # The narration before the cd lands in the right place either way; it is the lines *after* it that
+  # move, so assert on content rather than on the file existing.
+  want_grep "#2 DONE" "$ROOT/logs/run.log" "the run log is complete, not truncated at the cd into the repo"
+  want_grep "round 1: gate clean" "$ROOT/logs/run.log" "including the per-round narration"
+  [ -f "$ROOT/logs/2-implement.json" ]; want $? "per-invocation logs went to LOGS, not into the repo"
+  [ ! -e "$REPO/logs" ]; want $? "no log directory was created inside the target repo"
+  contains "logs/" "$(git -C "$REPO" show --stat HEAD)"
+  [ $? -ne 0 ]; want $? "and no logs were committed into the target repo by git add -A"
+}
+
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon no_push two_issues pushfail breaker preflight"
+ALL="happy fixround testcritic garbage abandon no_push two_issues pushfail breaker preflight moduleproxy relative_logs"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then
