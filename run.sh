@@ -47,6 +47,17 @@ command -v jq     >/dev/null || die "jq not on PATH"
 command -v go     >/dev/null || say "WARNING: go not on PATH — the build and test gate will be skipped"
 [ -d "$REPO/.git" ] || die "$REPO is not a git repository (mount the target repo there, or set REPO)"
 
+# The linter is where AGENTS.md's dependency rules, the purity rule and the doc-comment rules are
+# actually enforced. Both failure modes below are silent — the gate goes green while checking much
+# less than it claims to — which is exactly the kind of thing that must not be discovered in the
+# morning, after a night of commits.
+if [ -f "$REPO/go.mod" ] && [ -z "${ALLOW_NO_LINT:-}" ]; then
+  command -v "${LINT:-golangci-lint}" >/dev/null \
+    || die "${LINT:-golangci-lint} is not installed, so the gate cannot enforce the architecture rules in $REPO/.golangci.yml. Install golangci-lint >= v2.5.0, or set ALLOW_NO_LINT=1 to run with grep fallbacks and no lint enforcement."
+  [ -f "$REPO/.golangci.yml" ] || [ -f "$REPO/.golangci.yaml" ] || [ -f "$REPO/.golangci.toml" ] \
+    || die "no .golangci.yml in $REPO — golangci-lint would silently fall back to its five default linters and none of the dependency rules would be checked. Restore the config, or set ALLOW_NO_LINT=1."
+fi
+
 # Auth. Three ways in; check the one actually configured, and fail now rather than on
 # the first invocation an hour into the night.
 if [ "${CLAUDE_CODE_USE_BEDROCK:-}" = "1" ]; then
@@ -182,7 +193,8 @@ while :; do
   for round in $(seq 1 "$MAX_ROUNDS"); do
 
     # 1. Deterministic gate. Never spend model tokens reviewing code that does not build.
-    if ! REPO="$REPO" "$HARNESS/gate.sh" > "$LOGS/$N-gate-$round.txt" 2>&1; then
+    # BASE lets the gate notice a deleted test; LOGS keeps the coverage profile out of the repo.
+    if ! REPO="$REPO" BASE="$BASE" LOGS="$LOGS" "$HARNESS/gate.sh" > "$LOGS/$N-gate-$round.txt" 2>&1; then
       say "  round $round: gate failed"
       { cat "$HARNESS/prompts/fix.md"
         echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo

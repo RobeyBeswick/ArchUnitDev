@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# `timeout` is coreutils; it exists in the Docker image but not on a stock macOS box, and run.sh
+# wraps every model invocation in it. This shim drops the duration and runs the command, so the
+# harness test can run on a developer machine. It deliberately does not emulate the timeout itself.
+set -uo pipefail
+shift
+exec "$@"

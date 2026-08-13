@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+#
+# Stand-in for `claude -p`, used by test/loop_test.sh. Contacts no model and costs nothing.
+#
+# It works out which invocation it is from the --debug-file path, because that is the only place
+# run.sh puts the tag ("2-implement", "2-review-1", "2-fix-2", ...) into the command line. It
+# captures its stdin so the test can assert on what the harness actually put in each prompt, and
+# it edits the working tree for implement/fix invocations so the diff the critics see is non-empty.
+#
+set -uo pipefail
+
+: "${STUB_DIR:?stub needs STUB_DIR}"
+: "${SCENARIO:?stub needs SCENARIO}"
+
+tag=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--debug-file" ] && tag="$(basename "$a" .debug.log)"
+  prev="$a"
+done
+[ -n "$tag" ] || { echo "stub claude: no --debug-file in args" >&2; exit 64; }
+
+mkdir -p "$STUB_DIR"
+cat > "$STUB_DIR/$tag.stdin"
+printf '%s\n' "$tag" >> "$STUB_DIR/calls"
+
+round="${tag##*-}"   # meaningless for "*-implement", unused there
+
+result() {
+  jq -n --arg r "$1" '{
+    type: "result", subtype: "success", is_error: false, result: $r,
+    total_cost_usd: 0.01, num_turns: 3, terminal_reason: "end_turn"
+  }'
+}
+
+# A critic answer, in the envelope run.sh reads: .structured_output, validated by --json-schema.
+verdict_pass() {
+  jq -n '{
+    type: "result", subtype: "success", is_error: false, result: "PASS",
+    total_cost_usd: 0.02, num_turns: 5,
+    structured_output: { verdict: "PASS", findings: [] }
+  }'
+}
+verdict_fail() {
+  jq -n --arg f "$1" --arg p "$2" --arg x "$3" '{
+    type: "result", subtype: "success", is_error: false, result: "FAIL",
+    total_cost_usd: 0.02, num_turns: 5,
+    structured_output: { verdict: "FAIL", findings: [ { file: $f, problem: $p, fix: $x } ] }
+  }'
+}
+
+case "$tag" in
+  *-implement)
+    printf 'a feature, implemented by the stub\n' > feature.txt
+    result "Added feature.txt."
+    ;;
+
+  *-fix-*)
+    # The fix a real fixer would make, reduced to its observable effect: the tree changes, and the
+    # thing the reviewer objected to is now satisfiable.
+    printf 'FIXROUND-ACK: addressed the finding from round %s\n' "$round" >> NOTES.md
+    result "Addressed the findings; see NOTES.md."
+    ;;
+
+  *-review-*)
+    case "$SCENARIO" in
+      happy) verdict_pass ;;
+      fixround)
+        if grep -q FIXROUND-ACK NOTES.md 2>/dev/null
+          then verdict_pass
+          else verdict_fail feature.txt \
+                 "feature.txt is asserted by no test." \
+                 "Add a test that fails if feature.txt is empty."
+        fi ;;
+      garbage)
+        # Round 1 returns prose instead of JSON — a crashed, truncated or budget-capped critic.
+        # run.sh must fail closed rather than read this as a pass.
+        if [ "$round" = 1 ]
+          then printf 'I was not able to complete the review.\n'
+          else verdict_pass
+        fi ;;
+      always_fail)
+        verdict_fail feature.txt "Still not right." "Try again." ;;
+      *) echo "stub claude: unknown SCENARIO $SCENARIO" >&2; exit 64 ;;
+    esac
+    ;;
+
+  *-idiom-*)
+    verdict_pass
+    ;;
+
+  *)
+    echo "stub claude: unrecognised tag $tag" >&2; exit 64 ;;
+esac

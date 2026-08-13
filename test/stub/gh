@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+#
+# Stand-in for `gh`, used by test/loop_test.sh. Talks to no network.
+#
+# The open-issue queue is a file, so closing an issue really does shorten the queue and the loop
+# terminates the way it would against GitHub. It ignores the --jq expressions and prints what those
+# expressions would have produced.
+#
+set -uo pipefail
+
+: "${STUB_DIR:?stub needs STUB_DIR}"
+open="$STUB_DIR/open-issues"
+printf 'gh %s\n' "$*" >> "$STUB_DIR/gh-calls"
+
+# wants <needle> "$@" : the exact string appears as one of the remaining arguments.
+# (shift first — otherwise the needle is in its own haystack and every call matches)
+wants() { local needle="$1"; shift; printf '%s\n' "$@" | grep -qxF "$needle"; }
+
+case "${1:-} ${2:-}" in
+  "auth status")
+    exit 0 ;;
+
+  "issue list")
+    if wants length "$@"
+      then grep -c . "$open"
+      else grep . "$open" || true
+    fi ;;
+
+  "issue view")
+    n="$3"
+    if wants .title "$@"; then
+      printf 'Stub issue %s\n' "$n"
+    else
+      printf '# Stub issue %s\n\n' "$n"
+      printf 'A synthetic issue body, long enough that run.sh does not warn about an empty\n'
+      printf 'description. The stub implementer ignores it.\n'
+    fi ;;
+
+  "issue close")
+    n="$3"
+    grep -vxF "$n" "$open" > "$open.tmp" || true
+    mv "$open.tmp" "$open"
+    printf '%s\n' "$n" >> "$STUB_DIR/closed" ;;
+
+  "issue edit")    printf '%s\n' "$*" >> "$STUB_DIR/edited" ;;
+  "issue comment") printf '%s\n' "$*" >> "$STUB_DIR/commented" ;;
+
+  *)
+    echo "stub gh: unhandled command: $*" >&2
+    exit 1 ;;
+esac
