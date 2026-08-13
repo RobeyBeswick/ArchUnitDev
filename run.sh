@@ -26,6 +26,7 @@ TIMEOUT="${TIMEOUT:-30m}"           # wall clock per invocation
 MODEL="${MODEL:-global.anthropic.claude-opus-5}"
 FALLBACK_MODEL="${FALLBACK_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-400000}"
+NO_PUSH="${NO_PUSH:-}"              # set to 1 to commit locally but not push or close issues
 
 SCHEMA="$(cat "$HARNESS/schema/verdict.json")"
 SKIPPED="$LOGS/skipped"
@@ -221,10 +222,18 @@ while :; do
     else
       git commit -q -m "$TITLE" -m "Closes #$N" -m "Implemented by the ArchUnitDev loop." \
         || die "commit failed for #$N"
-      git push -q origin HEAD || say "WARNING: push failed for #$N — commit is local only"
+      if [ -n "$NO_PUSH" ]; then
+        say "#$N committed locally as $(git rev-parse --short HEAD); NO_PUSH set, not pushing"
+      else
+        git push -q origin HEAD || say "WARNING: push failed for #$N — commit is local only"
+      fi
     fi
-    gh issue close "$N" --comment "Implemented by the ArchUnitDev loop; both reviewers passed." >/dev/null \
-      || say "WARNING: could not close #$N"
+    if [ -n "$NO_PUSH" ]; then
+      say "#$N NO_PUSH set, leaving the issue open"
+    else
+      gh issue close "$N" --comment "Implemented by the ArchUnitDev loop; both reviewers passed." >/dev/null \
+        || say "WARNING: could not close #$N"
+    fi
     say "#$N DONE"
     done_count=$((done_count + 1))
   else
@@ -234,13 +243,15 @@ while :; do
       branch="abandoned/issue-$N"
       git commit -q -m "WIP #$N: $TITLE" -m "Abandoned by the ArchUnitDev loop after $MAX_ROUNDS rounds. Needs a human."
       git branch -f "$branch" HEAD
-      git push -q origin "$branch" || say "WARNING: could not push $branch"
+      [ -n "$NO_PUSH" ] || git push -q origin "$branch" || say "WARNING: could not push $branch"
       git reset -q --hard "$BASE"
-      say "#$N work parked on $branch; $REPO reset to $(git rev-parse --short "$BASE")"
+      say "#$N work parked on branch $branch; $REPO reset to $(git rev-parse --short "$BASE")"
     fi
-    gh issue edit "$N" --add-label needs-human >/dev/null 2>&1 \
-      || gh issue comment "$N" --body "The ArchUnitDev loop could not get this past review in $MAX_ROUNDS rounds. Needs a human." >/dev/null 2>&1 \
-      || say "WARNING: could not annotate #$N"
+    if [ -z "$NO_PUSH" ]; then
+      gh issue edit "$N" --add-label needs-human >/dev/null 2>&1 \
+        || gh issue comment "$N" --body "The ArchUnitDev loop could not get this past review in $MAX_ROUNDS rounds. Needs a human." >/dev/null 2>&1 \
+        || say "WARNING: could not annotate #$N"
+    fi
     echo "$N" >> "$SKIPPED"
   fi
 done

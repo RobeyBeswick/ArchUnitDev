@@ -87,16 +87,18 @@ Two things to get right:
 
   Or run the container with `--network host` and skip it.
 
-For a smoke test from a laptop, short-lived credentials passed as environment variables are fine — one
-issue finishes well inside their lifetime, and `run.sh` warns that they will not refresh:
+For a smoke test from a laptop there is no IMDS to read, so pass short-lived credentials in. One issue
+finishes well inside their lifetime, and `run.sh` warns that they will not refresh. Writing them to an
+`--env-file` keeps them off the command line and out of your shell history:
 
 ```bash
-eval "$(<credential-helper> --account <aws-account-id> --role Admin --format sh)"
+$AWS_CREDS_CMD | tr ' ' '\n' > /tmp/aws.env
 ```
 
 Egress needed: `bedrock-runtime.*.amazonaws.com` (the pinned model is a *global* inference profile, so
-it may route across regions), plus `github.com` and `api.github.com` for `gh`. Notably **not**
-`api.anthropic.com`.
+it may route across regions), `github.com` and `api.github.com` for `gh`, and
+`proxy.golang.org` + `sum.golang.org` — the extractor depends on `golang.org/x/tools`, so `go build`
+inside the gate will fetch modules. Notably **not** `api.anthropic.com`.
 
 A `GH_TOKEN` with `repo` scope is required regardless — the loop reads, comments on and closes issues,
 and pushes commits.
@@ -121,14 +123,17 @@ nohup docker run --rm \
 tail -f logs/run.log
 ```
 
-From a laptop, with short-lived credentials, for a smoke test:
+From a laptop, one issue, committing locally but pushing nothing:
 
 ```bash
+$AWS_CREDS_CMD | tr ' ' '\n' > /tmp/aws.env
+
 docker run --rm -it \
-  -e GH_TOKEN \
-  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-  -e MAX_ISSUES=1 \
-  -v "$PWD/ArchUnitGo:/work/repo" -v "$PWD/logs:/work/logs" \
+  --env-file /tmp/aws.env \
+  -e GH_TOKEN="$(gh auth token)" \
+  -e MAX_ISSUES=1 -e NO_PUSH=1 \
+  -v "$HOME/Projects/ArchUnitGo:/work/repo" \
+  -v "$PWD/logs:/work/logs" \
   archunitdev
 ```
 
@@ -154,6 +159,7 @@ All environment variables, all with defaults that work:
 | `MAX_ROUNDS` | `3` | Review/fix rounds before an issue is abandoned. |
 | `MAX_ISSUES` | `0` | `0` = run until the queue is empty. Set to `1` for a smoke test. |
 | `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. |
+| `NO_PUSH` | unset | Commit locally, but do not push and do not close the issue. Use it for the first run. |
 | `BUDGET_USD` | `5` | Per invocation, not per issue. |
 | `TIMEOUT` | `30m` | Wall clock per invocation. |
 | `MODEL` | `global.anthropic.claude-opus-5` | Bedrock model ID. The `opus` alias only resolves via `ANTHROPIC_DEFAULT_OPUS_MODEL`, which the container does not carry. |
