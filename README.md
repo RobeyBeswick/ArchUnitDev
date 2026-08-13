@@ -60,50 +60,83 @@ critics are told to treat a weakened check as always blocking.
 `abandoned/issue-N`, pushed, and the target repo is reset to the base commit so the next issue starts
 from a clean tree.
 
-## Prerequisites
+## Auth
 
-You need to pick an auth method, because the two behave differently in a container:
+Inference goes through **Amazon Bedrock** (account `<aws-account-id>`, `us-east-1`). The image sets
+`CLAUDE_CODE_USE_BEDROCK=1`, and `run.sh` verifies credentials with `aws sts get-caller-identity`
+before the first issue rather than failing an hour into the night. No `ANTHROPIC_API_KEY` is involved.
 
-| | Env var | Notes |
-|---|---|---|
-| API key | `ANTHROPIC_API_KEY` | Simplest for unattended runs. Metered per token. |
-| Subscription | `CLAUDE_CODE_OAUTH_TOKEN` | Generate with `claude setup-token` on a machine where you are logged in, then pass it as a secret. |
+**Use an EC2 instance profile.** Attach a role to the instance with `bedrock:InvokeModel` and
+`bedrock:InvokeModelWithResponseStream`, and the SDK credential chain inside the container picks it up
+from IMDS and refreshes it indefinitely. This is the only option that survives a full overnight run
+without further work.
 
-A `GH_TOKEN` with `repo` scope is also required — the loop reads, comments on and closes issues, and
-pushes commits.
+Two things to get right:
 
-> Note: this harness does **not** use `--bare`. That flag skips `CLAUDE.md` auto-discovery, and
-> ArchUnitGo's `CLAUDE.md` is what points the agents at `AGENTS.md`. If you switch it on, pass the
-> conventions in explicitly with `--add-dir` or `--append-system-prompt`.
+- **Do not set `AWS_PROFILE` in the container, and do not mount `~/.claude/settings.json`.** The host's
+  `claude-code` profile resolves credentials with `credential_process = <credential-helper>`, and
+  `<credential-helper>` does not exist in the image — so a container that inherits `AWS_PROFILE` fails to authenticate
+  even though the instance profile would have worked. `run.sh` warns when it sees this combination.
+- **Raise the IMDS hop limit to 2.** Docker's default bridge network adds a hop, and the EC2 default of
+  `http-put-response-hop-limit = 1` therefore blocks containers from reaching IMDS at all:
+
+  ```bash
+  aws ec2 modify-instance-metadata-options \
+    --instance-id i-xxxxxxxx --http-tokens required --http-put-response-hop-limit 2
+  ```
+
+  Or run the container with `--network host` and skip it.
+
+For a smoke test from a laptop, short-lived credentials passed as environment variables are fine — one
+issue finishes well inside their lifetime, and `run.sh` warns that they will not refresh:
+
+```bash
+eval "$(<credential-helper> --account <aws-account-id> --role Admin --format sh)"
+```
+
+Egress needed: `bedrock-runtime.*.amazonaws.com` (the pinned model is a *global* inference profile, so
+it may route across regions), plus `github.com` and `api.github.com` for `gh`. Notably **not**
+`api.anthropic.com`.
+
+A `GH_TOKEN` with `repo` scope is required regardless — the loop reads, comments on and closes issues,
+and pushes commits.
+
+> This harness does **not** use `--bare`. That flag skips `CLAUDE.md` auto-discovery, and ArchUnitGo's
+> `CLAUDE.md` is what points the agents at `AGENTS.md`. If you switch it on, pass the conventions in
+> explicitly with `--add-dir` or `--append-system-prompt`.
 
 ## Running it
+
+On EC2 in the Bedrock account, with an instance profile attached — nothing to pass but `GH_TOKEN`:
 
 ```bash
 docker build -t archunitdev .
 
-docker run --rm -it \
-  -e ANTHROPIC_API_KEY \
-  -e GH_TOKEN \
-  -v /home/ec2-user/ArchUnitGo:/work/repo \
-  -v /home/ec2-user/logs:/work/logs \
-  archunitdev
-```
-
-Directly, without Docker — needs `claude`, `gh`, `jq` and the Go toolchain on `PATH`:
-
-```bash
-REPO=/Users/you/Projects/ArchUnitGo LOGS=./logs ./run.sh
-```
-
-### On EC2
-
-```bash
 nohup docker run --rm \
-  -e ANTHROPIC_API_KEY -e GH_TOKEN \
-  -v "$PWD/ArchUnitGo:/work/repo" -v "$PWD/logs:/work/logs" \
+  -e GH_TOKEN \
+  -v "$PWD/ArchUnitGo:/work/repo" \
+  -v "$PWD/logs:/work/logs" \
   archunitdev > loop.out 2>&1 &
 
 tail -f logs/run.log
+```
+
+From a laptop, with short-lived credentials, for a smoke test:
+
+```bash
+docker run --rm -it \
+  -e GH_TOKEN \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+  -e MAX_ISSUES=1 \
+  -v "$PWD/ArchUnitGo:/work/repo" -v "$PWD/logs:/work/logs" \
+  archunitdev
+```
+
+Directly, without Docker — needs `claude`, `gh`, `jq`, `aws` and the Go toolchain on `PATH`. Your
+`~/.claude/settings.json` already supplies the Bedrock wiring, so `MODEL=opus` works here:
+
+```bash
+REPO=/Users/rbz/Projects/ArchUnitGo LOGS=./logs MAX_ISSUES=1 MODEL=opus ./run.sh
 ```
 
 `run.log` is the one-line-per-step narration. Everything else in `logs/` is per-invocation detail:
@@ -120,14 +153,21 @@ All environment variables, all with defaults that work:
 | `LOGS` | `$HARNESS/logs` | Log directory. |
 | `MAX_ROUNDS` | `3` | Review/fix rounds before an issue is abandoned. |
 | `MAX_ISSUES` | `0` | `0` = run until the queue is empty. Set to `1` for a smoke test. |
+| `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. |
 | `BUDGET_USD` | `5` | Per invocation, not per issue. |
 | `TIMEOUT` | `30m` | Wall clock per invocation. |
-| `MODEL` | `opus` | |
-| `FALLBACK_MODEL` | `sonnet` | Used automatically when the primary is overloaded. |
+| `MODEL` | `global.anthropic.claude-opus-5` | Bedrock model ID. The `opus` alias only resolves via `ANTHROPIC_DEFAULT_OPUS_MODEL`, which the container does not carry. |
+| `FALLBACK_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Used automatically when the primary is overloaded. |
 | `MAX_DIFF_BYTES` | `400000` | Diff truncation point for the critics. |
 
-**Do a single-issue dry run first.** `MAX_ISSUES=1 ./run.sh` costs a few dollars and tells you whether
-the prompts, auth and push path all work, which is worth knowing before committing to a night.
+Work up in two steps rather than trusting a fresh container with a night:
+
+```bash
+PREFLIGHT_ONLY=1 ./run.sh    # auth, tools, repo, remote, queue. Costs nothing.
+MAX_ISSUES=1    ./run.sh     # issue #1 end to end. Costs a few dollars.
+```
+
+The second one is the one that tells you whether the prompts, the commit and the push path work.
 
 ## Cost
 

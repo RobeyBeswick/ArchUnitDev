@@ -9,7 +9,7 @@ ARG TARGETARCH
 ARG UID=1000
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git jq ripgrep \
+      ca-certificates curl git jq ripgrep awscli \
     && rm -rf /var/lib/apt/lists/*
 
 RUN arch="${TARGETARCH:-amd64}" \
@@ -36,5 +36,12 @@ WORKDIR /harness
 ENV REPO=/work/repo \
     LOGS=/work/logs \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+# Inference goes through Bedrock. AWS_PROFILE is deliberately NOT set: the host profile
+# uses `credential_process = <credential-helper>`, which does not exist in here. With it
+# unset, the SDK credential chain falls through to the EC2 instance profile, which refreshes
+# itself and so survives a full overnight run.
+ENV CLAUDE_CODE_USE_BEDROCK=1 \
+    AWS_REGION=us-east-1
 
 ENTRYPOINT ["/harness/run.sh"]
