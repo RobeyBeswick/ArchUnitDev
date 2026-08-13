@@ -18,7 +18,6 @@ LOGS="${LOGS:-$HARNESS/logs}"
 
 MAX_ROUNDS="${MAX_ROUNDS:-3}"       # review/fix rounds before an issue is abandoned
 MAX_ISSUES="${MAX_ISSUES:-0}"       # 0 = run until the queue is empty
-BUDGET_USD="${BUDGET_USD:-5}"       # per invocation, not per issue
 TIMEOUT="${TIMEOUT:-30m}"           # wall clock per invocation
 # Bedrock model IDs, not the "opus"/"sonnet" aliases: the aliases only resolve via
 # ANTHROPIC_DEFAULT_*_MODEL, which lives in the host's ~/.claude/settings.json and is
@@ -45,6 +44,16 @@ command -v claude >/dev/null || die "claude not on PATH"
 command -v gh     >/dev/null || die "gh not on PATH"
 command -v jq     >/dev/null || die "jq not on PATH"
 command -v go     >/dev/null || say "WARNING: go not on PATH — the build and test gate will be skipped"
+
+# `timeout` is coreutils: it is in the image, but not on a stock macOS box, where it is `gtimeout`
+# or absent entirely. Resolve it once here — otherwise every invocation dies on "command not found"
+# and the run burns the whole queue doing nothing.
+if   command -v timeout  >/dev/null 2>&1; then TIMEOUT_CMD=(timeout "$TIMEOUT")
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD=(gtimeout "$TIMEOUT")
+else
+  TIMEOUT_CMD=()
+  say "WARNING: neither timeout nor gtimeout is on PATH — invocations will run with no wall-clock limit and TIMEOUT=$TIMEOUT is ignored. A wedged invocation will hang the run. Install coreutils."
+fi
 [ -d "$REPO/.git" ] || die "$REPO is not a git repository (mount the target repo there, or set REPO)"
 
 # The linter is where AGENTS.md's dependency rules, the purity rule and the doc-comment rules are
@@ -90,7 +99,7 @@ git config user.email >/dev/null 2>&1 || die "git user.email is not configured i
 git remote get-url origin >/dev/null 2>&1 || die "no git remote named origin"
 
 say "harness $HARNESS -> repo $REPO ($(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD))"
-say "model $MODEL (fallback $FALLBACK_MODEL), $MAX_ROUNDS rounds/issue, \$$BUDGET_USD and $TIMEOUT per invocation"
+say "model $MODEL (fallback $FALLBACK_MODEL), $MAX_ROUNDS rounds/issue, $TIMEOUT per invocation, no spend cap"
 say "queue: $(gh issue list --state open --limit 300 --json number --jq 'length') open issue(s)"
 
 # PREFLIGHT_ONLY=1 verifies the wiring — auth, tools, repo, remote, queue — and spends nothing.
@@ -110,12 +119,13 @@ fi
 # Only the harness holds the token. AWS credentials stay: Bedrock inference needs them.
 work() {
   local tag="$1"
+  # The +expansion guard is not decoration: bash 3.2, which is what macOS ships, treats
+  # "${arr[@]}" on an empty array as an unbound variable under `set -u`.
   env -u GH_TOKEN -u GITHUB_TOKEN \
-  timeout "$TIMEOUT" claude -p \
+  ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} claude -p \
     --model "$MODEL" \
     --fallback-model "$FALLBACK_MODEL" \
     --output-format json \
-    --max-budget-usd "$BUDGET_USD" \
     --no-session-persistence \
     --dangerously-skip-permissions \
     --debug-file "$LOGS/$tag.debug.log" \
@@ -130,22 +140,23 @@ work() {
 # Fails closed — a crashed or truncated critic is a FAIL, never a silent PASS.
 critic() {
   local tag="$1" out="$2"
+  # The +expansion guard is not decoration: bash 3.2, which is what macOS ships, treats
+  # "${arr[@]}" on an empty array as an unbound variable under `set -u`.
   env -u GH_TOKEN -u GITHUB_TOKEN \
-  timeout "$TIMEOUT" claude -p \
+  ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} claude -p \
     --model "$MODEL" \
     --fallback-model "$FALLBACK_MODEL" \
     --output-format json \
     --json-schema "$SCHEMA" \
     --tools "Read,Grep,Glob" \
     --dangerously-skip-permissions \
-    --max-budget-usd "$BUDGET_USD" \
     --no-session-persistence \
     --debug-file "$LOGS/$tag.debug.log" \
     > "$LOGS/$tag.json" 2>>"$LOGS/run.log"
 
   if ! jq -e '.structured_output.verdict' "$LOGS/$tag.json" >/dev/null 2>&1; then
     say "  $tag: no structured output — failing closed"
-    printf '{"verdict":"FAIL","findings":[{"file":"-","problem":"The %s invocation did not return a verdict (crash, timeout or budget cap).","fix":"Re-run; if it repeats, the diff is probably too large to review in one pass."}]}\n' "$tag" > "$out"
+    printf '{"verdict":"FAIL","findings":[{"file":"-","problem":"The %s invocation did not return a verdict (crash or timeout).","fix":"Re-run; if it repeats, the diff is probably too large to review in one pass."}]}\n' "$tag" > "$out"
     return 0
   fi
   jq '.structured_output' "$LOGS/$tag.json" > "$out"
