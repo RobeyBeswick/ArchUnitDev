@@ -33,11 +33,15 @@ Two things about it worth knowing:
   reason, e.g. `//nolint:gochecknoglobals // immutable lookup table; Go has no const array`. That
   particular one is the sanctioned pattern for a package-level lookup table — do not contort the code
   into a function or a `switch` to avoid it. A bare `//nolint` or `//nolint:all` is itself a finding.
-- **If you add a non-terminal fluent chain method, add it to `govet.unusedresult.funcs` in
-  `.golangci.yml`.** An unterminated chain like `ProjectFiles().InFolder("x")` as a bare statement
-  compiles and silently does nothing, with no compile error. That list is what turns it into a build
-  failure, and it only covers the methods named in it. A reviewer will block a new stage method that is
-  missing from it.
+- **Do not add fluent chain methods to `govet.unusedresult.funcs`, and do not shorten the list that
+  is there.** An unterminated chain like `ProjectFiles().InFolder("x")` as a bare statement compiles
+  and silently does nothing, with no compile error — but that list *cannot* catch it. The analyzer
+  tests `sig.Recv() != nil` and sends every method down a separate path that only fires for a
+  signature of exactly `func() string`, so an entry for a fluent method is inert. Package-level entry
+  points do work there. The list's real content is the analyzer's own defaults —
+  `slices.Clone`, `slices.Delete`, `maps.Clone` and the rest — which are only present because setting
+  the flag *replaces* them rather than adding to them. Deleting one of those silently switches off a
+  live check.
 
 Work in this order:
 

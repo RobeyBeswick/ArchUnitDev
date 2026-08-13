@@ -116,11 +116,19 @@ This is the product, and `AGENTS.md` specifies it tightly.
   never name them. If they are interfaces, give them an unexported method so nobody outside can
   implement them and you can add methods later without breaking anyone (`testing.TB` does exactly this).
 
-**One concrete, checkable obligation.** An unterminated chain — `ProjectFiles().InFolder("x")` as a
-bare statement — compiles and silently does nothing, with no compile error. That is zerolog's
-documented worst failure mode. `.golangci.yml` turns it into a build failure via
-`govet.unusedresult.funcs`, but **only for the methods listed there.** If this diff adds a non-terminal
-chain method and does not add it to that list, that is a blocking finding.
+**The unterminated chain is yours, because no linter can take it.** `ProjectFiles().InFolder("x")` as a
+bare statement compiles and silently does nothing, with no compile error — zerolog's documented worst
+failure mode. `govet`'s `unusedresult` looks like the answer and is not: it tests `sig.Recv() != nil`
+and routes every method to a path that fires only for a signature of exactly `func() string`, so no
+entry in `govet.unusedresult.funcs` can ever report a fluent method. Do not ask for one to be added,
+and treat an entry that was added as inert rather than as protection.
+
+So read for it. A bare non-terminal call as a statement — in the library, in a test, in an example or in
+a doc comment — is a blocking finding, and it is the one defect in this category that will otherwise
+reach a user. What *is* mechanically enforced is the rest of that list: the analyzer's defaults, which
+include `slices.Clone`, `slices.Delete`, `slices.Insert` and `maps.Clone`. Since setting the flag
+replaces the defaults instead of extending them, **a diff that shortens that list is disabling live
+checks, and that is blocking too.**
 
 ### 4. A doc comment that is well-formed but not true
 

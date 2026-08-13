@@ -192,7 +192,6 @@ All environment variables, all with defaults that work:
 | `MAX_ISSUES` | `0` | `0` = run until the queue is empty. Set to `1` for a smoke test. |
 | `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. |
 | `NO_PUSH` | unset | Commit locally, but do not push and do not close the issue. Use it for the first run. |
-| `BUDGET_USD` | `5` | Per invocation, not per issue. |
 | `TIMEOUT` | `30m` | Wall clock per invocation. |
 | `MODEL` | `global.anthropic.claude-opus-5` | Bedrock model ID. The `opus` alias only resolves via `ANTHROPIC_DEFAULT_OPUS_MODEL`, which the container does not carry. |
 | `FALLBACK_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Used automatically when the primary is overloaded. |
@@ -243,8 +242,15 @@ what the harness actually put in each prompt, and edits the working tree so the 
 ## Cost
 
 Roughly 3–7 invocations per issue (one implementer, two critics and one fixer per round). Budget on the
-order of a few dollars per issue; `BUDGET_USD` caps each invocation and the run prints the total from the
-JSON envelopes at the end. Watch the first two or three issues before walking away.
+order of a few dollars per issue, and the run prints the total from the JSON envelopes at the end.
+
+**There is deliberately no per-invocation spend cap.** There was one (`--max-budget-usd`) and it was
+removed: an invocation that hits a cap is killed mid-edit, which for the implementer means a half-written
+package that the gate then rejects, and for a critic means no verdict at all — the fail-closed path turns
+that into a `FAIL` and burns a round on a finding nobody wrote. A truncated round costs more than the
+tokens it saved. `TIMEOUT` is the remaining stop, and a wall clock is the honest one: it bounds a *wedged*
+invocation without punishing an expensive but productive one. Watch the first two or three issues before
+walking away.
 
 ## Known limits
 
