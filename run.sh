@@ -59,8 +59,13 @@ if [ "${CLAUDE_CODE_USE_BEDROCK:-}" = "1" ]; then
   caller=$(aws sts get-caller-identity --query Arn --output text 2>&1) \
     || die "CLAUDE_CODE_USE_BEDROCK=1 but no usable AWS credentials: $caller"
   say "auth: Bedrock in ${AWS_REGION:-${AWS_DEFAULT_REGION:-unset-region}} as $caller"
+  # Static creds in the environment do not refresh. Fine for a bounded smoke test; for an
+  # unbounded run they die partway through the night, so that needs saying out loud.
   if [ -n "${AWS_SESSION_TOKEN:-}" ] && [ -z "${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI:-}" ]; then
-    say "WARNING: using static temporary credentials from the environment. These expire and will NOT refresh — fine for a smoke test, not for a full overnight run. Prefer an EC2 instance profile."
+    if [ "$MAX_ISSUES" -eq 0 ] && [ -z "${ALLOW_STATIC_CREDS:-}" ]; then
+      die "refusing an unbounded run on static temporary credentials — they will expire partway through and every invocation after that fails. Use an EC2 instance profile, or set MAX_ISSUES to something that finishes inside their lifetime, or set ALLOW_STATIC_CREDS=1 to override."
+    fi
+    say "WARNING: static temporary credentials — these will NOT refresh. Fine for MAX_ISSUES=$MAX_ISSUES, not for a full run."
   fi
 elif [ -n "${ANTHROPIC_API_KEY:-}${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
   say "auth: Anthropic API"
@@ -87,8 +92,14 @@ fi
 # --- the two kinds of invocation -------------------------------------------------
 
 # work <tag>   : full tool access, edits the repo. Prompt on stdin.
+#
+# GH_TOKEN is stripped from the environment. The prompts tell the implementer not to push or
+# close issues, but a prompt is a request; with no token and no ~/.config/gh in the image,
+# `gh` cannot authenticate and `git push` over HTTPS has no credential — so it is enforced.
+# Only the harness holds the token. AWS credentials stay: Bedrock inference needs them.
 work() {
   local tag="$1"
+  env -u GH_TOKEN -u GITHUB_TOKEN \
   timeout "$TIMEOUT" claude -p \
     --model "$MODEL" \
     --fallback-model "$FALLBACK_MODEL" \
@@ -108,6 +119,7 @@ work() {
 # Fails closed — a crashed or truncated critic is a FAIL, never a silent PASS.
 critic() {
   local tag="$1" out="$2"
+  env -u GH_TOKEN -u GITHUB_TOKEN \
   timeout "$TIMEOUT" claude -p \
     --model "$MODEL" \
     --fallback-model "$FALLBACK_MODEL" \
