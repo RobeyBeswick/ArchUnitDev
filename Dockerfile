@@ -5,6 +5,9 @@
 FROM golang:1-bookworm
 
 ARG GH_VERSION=2.65.0
+# Pinned on purpose. A floating @latest linter means yesterday's green commit fails tonight,
+# halfway through an unattended run, on a rule nobody chose to adopt.
+ARG GOLANGCI_VERSION=v2.12.2
 ARG TARGETARCH
 ARG UID=1000
 
@@ -17,6 +20,15 @@ RUN arch="${TARGETARCH:-amd64}" \
        | tar -xz -C /tmp \
     && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" /usr/local/bin/gh \
     && rm -rf /tmp/gh_*
+
+# golangci-lint is not optional: the target repo's .golangci.yml is where AGENTS.md's four
+# dependency rules, the purity rule and the doc-comment rules are actually enforced, so without it
+# the gate silently stops checking the architecture. run.sh refuses to start an unattended run if
+# it is missing. Installed via the upstream script because it resolves the release asset name and
+# architecture itself; `go install` would work too but produces a binary with no version metadata.
+RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+      | sh -s -- -b /usr/local/bin "${GOLANGCI_VERSION}" \
+    && golangci-lint --version
 
 RUN useradd -m -u "${UID}" dev && mkdir -p /work && chown dev:dev /work
 USER dev
