@@ -90,6 +90,22 @@ separator normalisation in `Filter.Matches` could be deleted with the whole suit
 `Pattern.Matches` normalises a second time and no Filter-level test ever passed a backslash. Both were
 confirmed by mutating the code and re-running.
 
+It has since done the same thing inside the loop, on its first live run. On issue #5 the implementer's
+`WithDefaults` returned a bare `*o`, which copies the struct but leaves `BuildTags` pointing at the
+caller's backing array — a terminal appending a build tag to its resolved options would write through
+into the user's own. The correctness reviewer and the idiom critic passed it in every round. The test
+critic blocked on the test instead of the code: the aliasing test only asserted that the caller was
+unchanged, and the one field where copying is a real decision was never touched. The fixer's response
+was to add the `slices.Clone`. Three instances of that bug class so far, and this reviewer has caught
+all three.
+
+The same issue is the argument for its round-2 finding too, and against how it delivered it: the second
+verdict said the test never asserted that the resolved copy *carries* the caller's values, so
+`WithDefaults` dropping four of six fields was undetectable — which was equally true of the round-1
+test. Two findings about one test, one round apart, on an issue that then landed on the last round it
+had. All three prompts now say to report everything blocking in one pass, because a held-back finding
+is a round the issue may not have.
+
 Its prompt is built on one mechanism — **name the mutation**. For every test, state the one-line change
 to the implementation that makes it fail; if you cannot, the test asserts nothing and that is a block.
 It is explicitly forbidden from reporting coverage percentages (there is no threshold in the gate) or
@@ -200,6 +216,13 @@ REPO=/Users/rbz/Projects/ArchUnitGo LOGS=./logs MAX_ISSUES=1 MODEL=opus ./run.sh
 `N-implement.json` (the full envelope, including `total_cost_usd`), `N-review-1.verdict.json`,
 `N-diff-1.patch`, `N-gate-1.txt`, and `*.debug.log`.
 
+Two of the files in `logs/` are state rather than output, and they are the only state the harness
+keeps outside git and the issues themselves. `skipped` lists the issues abandoned after
+`MAX_ROUNDS`; `landed` lists the issues that were implemented but deliberately left open, which
+only happens under `NO_PUSH`. Both are excluded from the queue. Delete them to make the loop
+reconsider an issue — and delete `landed` if you throw away the local commits it refers to,
+or the queue will skip work that is no longer there.
+
 ## Knobs
 
 All environment variables, all with defaults that work:
@@ -211,7 +234,7 @@ All environment variables, all with defaults that work:
 | `MAX_ROUNDS` | `3` | Review/fix rounds before an issue is abandoned. |
 | `MAX_ISSUES` | `0` | `0` = run until the queue is empty. Set to `1` for a smoke test. |
 | `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. |
-| `NO_PUSH` | unset | Commit locally, but do not push and do not close the issue. Use it for the first run. |
+| `NO_PUSH` | unset | Commit locally, but do not push and do not close the issue. Use it for the first run. The issue is recorded in `logs/landed` so the queue still advances. |
 | `TIMEOUT` | `30m` | Wall clock per invocation. |
 | `MODEL` | `global.anthropic.claude-opus-5` | Bedrock model ID. The `opus` alias only resolves via `ANTHROPIC_DEFAULT_OPUS_MODEL`, which the container does not carry. |
 | `FALLBACK_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Used automatically when the primary is overloaded. |
@@ -247,6 +270,7 @@ machinery. The scenarios are:
 | `garbage` | A critic returns unparseable output: fail closed, with a synthesised finding, never a silent pass. |
 | `abandon` | `MAX_ROUNDS` exhausted: work parked on `abandoned/issue-N`, pushed, repo reset to base, issue labelled and skipped, run carries on. |
 | `no_push` | `NO_PUSH=1` commits locally and touches nothing remote. |
+| `two_issues` | Two issues in one run: the queue advances, the second issue's base is the first one's commit, and each issue is implemented exactly once. |
 | `preflight` | A Go repo with no `.golangci.yml`, and a missing linter binary, are both fatal — and `ALLOW_NO_LINT=1` overrides both. |
 
 ```bash

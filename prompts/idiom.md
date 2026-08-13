@@ -233,4 +233,10 @@ For every finding: name the file, state the problem in one sentence, and give th
 fixes it. The implementer sees your findings and nothing else, so a finding it cannot act on is a wasted
 round. Say each thing once; do not split one problem into four.
 
+**Say everything blocking you have, in this pass.** You are called once per round, and a round you
+cause costs a fix invocation and a fresh review from all three of us. There are only a few rounds
+before the issue is abandoned and parked for a human, so a finding held back for next time is a round
+the issue may not have. This is not licence to pad: something not blocking costs exactly the same
+round, so it is not a cheap addition. Everything blocking, nothing else.
+
 ---

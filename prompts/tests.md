@@ -188,4 +188,17 @@ fixes it — and for this role the fix is nearly always "assert P, which fails i
 implementation". Spell out M. The implementer sees your findings and nothing else, and "add a better
 test" is not something it can act on.
 
+**Say everything blocking you have, in this pass.** You are called once per round, and a round you
+cause costs a fix invocation and a fresh review from all three of us. There are only a few rounds
+before the issue is abandoned and parked for a human, so a finding held back for next time is a round
+the issue may not have. This is not licence to pad: something not blocking costs exactly the same
+round, so it is not a cheap addition. Everything blocking, nothing else.
+
+This role has already cost an issue a round by not doing that. On issue #5 the round-1 verdict
+reported one test as a condition that could not be false; the round-2 verdict reported that the same
+test never asserted the resolved copy carried the caller's values — which was just as true of the
+version in round 1, and was a second mutation the test could not detect. Two findings about one test,
+one round apart, and the issue landed on the last round it had. Both were in front of the round-1
+reviewer. Enumerate the mutations the test misses, and report all of them.
+
 ---
