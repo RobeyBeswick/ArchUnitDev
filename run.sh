@@ -29,6 +29,7 @@ MODEL="${MODEL:-global.anthropic.claude-opus-5}"
 FALLBACK_MODEL="${FALLBACK_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-400000}"
 NO_PUSH="${NO_PUSH:-}"              # set to 1 to commit locally but not push or close issues
+MAX_CONSECUTIVE_ABANDONS="${MAX_CONSECUTIVE_ABANDONS:-2}"   # stop the run after this many in a row; 0 = never stop
 
 SCHEMA="$(cat "$HARNESS/schema/verdict.json")"
 SKIPPED="$LOGS/skipped"          # abandoned: got no further after MAX_ROUNDS, needs a human
@@ -185,8 +186,25 @@ findings_text() {
 # --- the loop --------------------------------------------------------------------
 
 done_count=0
+attempted=0
+consecutive_abandons=0
 while :; do
   [ "$MAX_ISSUES" -gt 0 ] && [ "$done_count" -ge "$MAX_ISSUES" ] && { say "hit MAX_ISSUES=$MAX_ISSUES"; break; }
+
+  # Two circuit breakers, both aimed at the same failure: the environment breaks partway through a
+  # long queue and the loop keeps going, abandoning every remaining issue for a reason that has
+  # nothing to do with the issue. Each abandonment costs an implement invocation, MAX_ROUNDS fix
+  # invocations and every critic in between, and leaves a needs-human label on work nobody has
+  # looked at. Stopping is recoverable; a queue of spurious abandonments is not.
+  if [ "$attempted" -gt 0 ] && [ "${CLAUDE_CODE_USE_BEDROCK:-}" = "1" ]; then
+    # Credentials are the likeliest thing to go: a role session expires mid-run, every invocation
+    # after it fails, and every critic fails closed into a FAIL. One free API call rules it out.
+    aws sts get-caller-identity >/dev/null 2>&1 \
+      || die "AWS credentials stopped resolving after $attempted issue(s) — stopping before the rest of the queue is abandoned over it. Refresh them and run again; the queue picks up from the issues still open."
+  fi
+  if [ "$MAX_CONSECUTIVE_ABANDONS" -gt 0 ] && [ "$consecutive_abandons" -ge "$MAX_CONSECUTIVE_ABANDONS" ]; then
+    die "$consecutive_abandons issue(s) abandoned in a row — stopping. That is far more often a broken environment (expired credentials, a wedged toolchain, a model outage, a missing dependency every issue needs) than several independently hard issues. The work is parked on branches and the numbers are in $(basename "$SKIPPED"); set MAX_CONSECUTIVE_ABANDONS=0 to run through them anyway."
+  fi
 
   # The queue: open issues, lowest number first (the issues are numbered in dependency
   # order), minus the ones this run gave up on and the ones it landed without closing.
@@ -290,29 +308,45 @@ while :; do
   done
 
   # --- land it, or hand it to a human ---
+  #
+  # An issue is resolved only when the work implementing it is on origin. Nothing below closes an
+  # issue on any weaker basis than that: not an approval with nothing to show for it, and not a
+  # commit that never left this machine.
   git add -A
-  if [ "$approved" = 1 ]; then
-    if git diff --cached --quiet "$BASE"; then
-      say "#$N approved but the tree matches base — closing without a commit"
-    else
-      git commit -q -m "$TITLE" -m "Closes #$N" -m "Implemented by the ArchUnitDev loop." \
-        || die "commit failed for #$N"
-      if [ -n "$NO_PUSH" ]; then
-        say "#$N committed locally as $(git rev-parse --short HEAD); NO_PUSH set, not pushing"
-      else
-        git push -q origin HEAD || say "WARNING: push failed for #$N — commit is local only"
-      fi
-    fi
+  if [ "$approved" = 1 ] && git diff --cached --quiet "$BASE"; then
+    # Unanimous approval of an empty tree. It should be unreachable — an empty diff breaks the round
+    # loop before any critic runs — so if it happens the interesting thing is why, and closing the
+    # issue would destroy the evidence and the issue with it.
+    say "#$N WARNING: all critics approved but the tree matches base. Leaving the issue OPEN and skipping it: an issue is not resolved by an approval with no commit behind it."
+    echo "$N" >> "$SKIPPED"
+    consecutive_abandons=$((consecutive_abandons + 1))
+  elif [ "$approved" = 1 ]; then
+    git commit -q -m "$TITLE" -m "Closes #$N" -m "Implemented by the ArchUnitDev loop." \
+      || die "commit failed for #$N"
+    landed_as=$(git rev-parse --short HEAD)
     if [ -n "$NO_PUSH" ]; then
       # Recorded so the queue moves on: see the comment on LANDED above.
       echo "$N" >> "$LANDED"
-      say "#$N NO_PUSH set, leaving the issue open and recording it in $(basename "$LANDED")"
+      say "#$N committed locally as $landed_as; NO_PUSH set, so not pushing and leaving the issue open (recorded in $(basename "$LANDED"))"
+      say "#$N DONE"
+      done_count=$((done_count + 1))
+      consecutive_abandons=0
+    elif git push -q origin HEAD; then
+      # The commit message closes the issue by itself once it is on the default branch; this is the
+      # belt to that braces, and it is also what leaves the review trail on the issue.
+      say "#$N pushed as $landed_as"
+      gh issue close "$N" --comment "Implemented by the ArchUnitDev loop; all ${#CRITICS[@]} reviewers passed." >/dev/null 2>&1 \
+        || say "  (#$N was already closed by the commit message, or could not be closed — the work is on origin either way)"
+      say "#$N DONE"
+      done_count=$((done_count + 1))
+      consecutive_abandons=0
     else
-      gh issue close "$N" --comment "Implemented by the ArchUnitDev loop; all ${#CRITICS[@]} reviewers passed." >/dev/null \
-        || say "WARNING: could not close #$N"
+      # The work is committed locally and reachable, so nothing is lost — but it is not on origin,
+      # so the issue is not resolved and must not be closed. Stopping rather than carrying on: every
+      # later push fails the same way, and a run that closes issues while nothing reaches origin is
+      # the worst outcome available.
+      die "push failed for #$N — the commit is local only ($landed_as), so the issue stays OPEN. Nothing after this would reach origin either. Fix the remote and run again: the queue resumes from the issues still open."
     fi
-    say "#$N DONE"
-    done_count=$((done_count + 1))
   else
     # Abandon: keep the work on a branch so nothing is lost, reset main, move on.
     say "#$N ABANDONED after $MAX_ROUNDS rounds — parking the work and leaving the issue open"
@@ -330,7 +364,9 @@ while :; do
         || say "WARNING: could not annotate #$N"
     fi
     echo "$N" >> "$SKIPPED"
+    consecutive_abandons=$((consecutive_abandons + 1))
   fi
+  attempted=$((attempted + 1))
 done
 
 say "run finished: $done_count issue(s) landed, $(wc -l < "$SKIPPED" | tr -d ' ') abandoned"

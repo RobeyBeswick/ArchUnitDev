@@ -187,7 +187,7 @@ scenario_no_push() {
   run_loop happy MAX_ISSUES=1 NO_PUSH=1
 
   want "$RC" "exits 0"
-  want_grep "NO_PUSH set, not pushing" "$ROOT/run.out" "the push was skipped"
+  want_grep "NO_PUSH set, so not pushing" "$ROOT/run.out" "the push was skipped"
   want_grep "leaving the issue open"   "$ROOT/run.out" "the issue was left open"
   [ "$(commits)" = 2 ]; want $? "the commit was still made locally"
   [ -f "$STUB_DIR/closed" ] && bad "an issue was closed despite NO_PUSH" || ok "no issue was closed"
@@ -232,6 +232,45 @@ scenario_two_issues() {
   [ "$(git -C "$ROOT/origin.git" rev-list --count main)" = 1 ]; want $? "origin was not advanced"
 }
 
+# A push that fails must not close the issue. This is the one path where the loop could report an
+# issue resolved with nothing on origin to show for it, so it stops the run instead.
+scenario_pushfail() {
+  setup
+  git -C "$REPO" remote set-url origin "$ROOT/there-is-no-remote-here.git"
+  run_loop happy MAX_ISSUES=1
+
+  [ "$RC" -ne 0 ]; want $? "the run stops rather than carrying on"
+  want_grep "push failed for #2" "$ROOT/run.out" "and says which issue"
+  want_grep "the issue stays OPEN" "$ROOT/run.out" "and that the issue was not resolved"
+  [ -f "$STUB_DIR/closed" ] && bad "the issue was closed with nothing on origin" \
+                            || ok "the issue was NOT closed"
+  [ "$(commits)" = 2 ]; want $? "the work is still committed locally, so nothing is lost"
+  want_no_grep "DONE" "$ROOT/run.out" "the issue was not reported as done"
+}
+
+# Consecutive abandonments mean the environment broke, not that every issue is hard. The run must
+# stop instead of spending an implement plus MAX_ROUNDS of fixes on each remaining issue.
+scenario_breaker() {
+  setup
+  printf '2\n3\n4\n' > "$STUB_DIR/open-issues"
+  run_loop always_fail MAX_CONSECUTIVE_ABANDONS=2
+
+  [ "$RC" -ne 0 ]; want $? "the run stops"
+  want_grep "2 issue(s) abandoned in a row" "$ROOT/run.out" "and says why"
+  want_grep "2-implement" "$STUB_DIR/calls" "the first issue was attempted"
+  want_grep "3-implement" "$STUB_DIR/calls" "the second issue was attempted"
+  want_no_grep "4-implement" "$STUB_DIR/calls" "the third issue was never started"
+  [ "$(grep -c . "$LOGS/skipped")" = 2 ]; want $? "exactly the two attempted issues are skipped"
+
+  # ...and the escape hatch, for a queue you have decided really is that hard.
+  setup
+  printf '2\n3\n4\n' > "$STUB_DIR/open-issues"
+  run_loop always_fail MAX_CONSECUTIVE_ABANDONS=0
+  want "$RC" "MAX_CONSECUTIVE_ABANDONS=0 runs the queue out"
+  want_grep "4-implement" "$STUB_DIR/calls" "every issue was attempted"
+  want_grep "0 issue(s) landed, 3 abandoned" "$ROOT/run.out" "and the summary is accurate"
+}
+
 # The two silent-defeat guards in preflight: a Go repo whose lint enforcement is not actually there.
 # A green gate that checks less than it claims is the worst outcome an overnight run can have, so
 # both of these must be fatal before any work starts, not warnings.
@@ -256,7 +295,7 @@ scenario_preflight() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon no_push two_issues preflight"
+ALL="happy fixround testcritic garbage abandon no_push two_issues pushfail breaker preflight"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then
