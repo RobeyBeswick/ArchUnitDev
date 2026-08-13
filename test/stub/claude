@@ -64,7 +64,7 @@ case "$tag" in
 
   *-review-*)
     case "$SCENARIO" in
-      happy) verdict_pass ;;
+      happy|testcritic) verdict_pass ;;
       fixround)
         if grep -q FIXROUND-ACK NOTES.md 2>/dev/null
           then verdict_pass
@@ -87,6 +87,21 @@ case "$tag" in
 
   *-idiom-*)
     verdict_pass
+    ;;
+
+  *-tests-*)
+    case "$SCENARIO" in
+      # The test critic objects while the other two pass. That is what proves run.sh sends the fixer
+      # one findings section rather than an empty heading for every critic that had nothing to say.
+      testcritic)
+        if grep -q FIXROUND-ACK NOTES.md 2>/dev/null
+          then verdict_pass
+          else verdict_fail feature_test.go \
+                 "Nothing asserts that feature.txt is non-empty." \
+                 "Assert on its contents: emptying the file must fail the test."
+        fi ;;
+      *) verdict_pass ;;
+    esac
     ;;
 
   *)

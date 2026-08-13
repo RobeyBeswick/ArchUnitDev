@@ -1,7 +1,8 @@
 # ArchUnitDev
 
 An unattended implement / review / fix loop that works through a repository's open GitHub issues with
-three Claude Code invocations: an **implementer**, a **correctness reviewer** and an **idiom critic**.
+four Claude Code invocations: an **implementer**, a **correctness reviewer**, an **idiom critic** and a
+**test critic**.
 
 Built to drive [ArchUnitGo](https://github.com/LukasNiessen/ArchUnitGo) from an empty repo to a working
 library across 44 dependency-ordered issues, but it is not specific to it beyond the prompts.
@@ -18,7 +19,8 @@ for the lowest-numbered open issue:
                       │      └──▶ fixer ──┐  (does not cost a review round)
                       │                   │
                       ├─ reviewer ────┐   │
-                      │  idiom critic ┴───┴──▶ both PASS? ──▶ commit, push, close issue
+                      ├─ idiom critic │   │
+                      │  test critic  ┴───┴──▶ all PASS? ───▶ commit, push, close issue
                       │                            │ no
                       └────────── fixer ◀──────────┘   × MAX_ROUNDS
                                                        │ exhausted
@@ -67,14 +69,32 @@ harness generates the diff and pipes it in.
 into the response's `structured_output` field, which the loop reads with `jq`. No `grep '^APPROVED'`
 false positives.
 
-**Everything fails closed.** A critic that crashes, times out or hits its budget cap counts as `FAIL`,
-never as a silent pass.
+**Everything fails closed.** A critic that crashes or times out counts as `FAIL`, never as a silent pass.
+Approval is unanimous, and the critics run concurrently, so a third reviewer costs about a dollar a round
+and no wall-clock at all.
 
-**The two critics do not overlap.** The reviewer owns correctness, the data-model invariants and whether
-the tests are real. The idiom critic owns conformance to `AGENTS.md` — the fluent-API grammar, the
-naming table, the layout and the four dependency rules. Both are told to return `PASS` when their only
+**The three critics do not overlap**, and keeping them disjoint is the whole design. The reviewer owns
+correctness and the data-model invariants. The idiom critic owns conformance to `AGENTS.md` — the
+fluent-API grammar, the naming table, the layout and the four dependency rules. The test critic owns
+whether the tests would fail if the code were wrong. All three are told to return `PASS` when their only
 findings are cosmetic, which is what stops the idiom critic becoming a rename generator that never
-approves.
+approves. Each round, only the critics that actually found something contribute a section to the fixer's
+prompt.
+
+**The test critic exists because the other two demonstrably missed this class of defect.** On issue #2
+both returned `PASS` with no findings, and the diff contained a `TestFiltersAreImmutable` that passed
+against a `Filter.Excluding` with its `slices.Clone` deleted — it asserted only that the *parent* was
+unchanged, which is true even with the bug, because appending to a nil slice always allocates. Run
+against that same diff afterwards, the test critic found it, plus a second gap nobody had noticed: the
+separator normalisation in `Filter.Matches` could be deleted with the whole suite still green, because
+`Pattern.Matches` normalises a second time and no Filter-level test ever passed a backslash. Both were
+confirmed by mutating the code and re-running.
+
+Its prompt is built on one mechanism — **name the mutation**. For every test, state the one-line change
+to the implementation that makes it fail; if you cannot, the test asserts nothing and that is a block.
+It is explicitly forbidden from reporting coverage percentages (there is no threshold in the gate) or
+asking for a test without naming what would break, which is how a test reviewer turns into a
+work generator.
 
 **Reward hacking is checked for explicitly.** The cheapest way to make `go test` pass is to stop running
 the tests, so `gate.sh` fails on `t.Skip` (unless the line carries an `ALLOW-SKIP: <reason>`, so a
@@ -221,8 +241,9 @@ machinery. The scenarios are:
 
 | Scenario | What it pins down |
 |---|---|
-| `happy` | Both critics pass: commit, push, close, and no coverage profile left in the repo. |
+| `happy` | All three critics pass: commit, push, close, and no coverage profile left in the repo. |
 | `fixround` | A critic returns `FAIL`; the finding's `problem` and `fix` text reach the fix prompt; round 2 re-reviews and lands. |
+| `testcritic` | Only the third critic objects: its findings reach the fixer attributed to it, and the two that passed contribute no empty section. |
 | `garbage` | A critic returns unparseable output: fail closed, with a synthesised finding, never a silent pass. |
 | `abandon` | `MAX_ROUNDS` exhausted: work parked on `abandoned/issue-N`, pushed, repo reset to base, issue labelled and skipped, run carries on. |
 | `no_push` | `NO_PUSH=1` commits locally and touches nothing remote. |
@@ -241,7 +262,7 @@ what the harness actually put in each prompt, and edits the working tree so the 
 
 ## Cost
 
-Roughly 3–7 invocations per issue (one implementer, two critics and one fixer per round). Budget on the
+Roughly 4–9 invocations per issue (one implementer, three critics and one fixer per round). Budget on the
 order of a few dollars per issue, and the run prints the total from the JSON envelopes at the end.
 
 **There is deliberately no per-invocation spend cap.** There was one (`--max-budget-usd`) and it was

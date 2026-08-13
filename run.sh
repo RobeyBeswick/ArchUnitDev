@@ -17,6 +17,9 @@ REPO="${REPO:-/work/repo}"
 LOGS="${LOGS:-$HARNESS/logs}"
 
 MAX_ROUNDS="${MAX_ROUNDS:-3}"       # review/fix rounds before an issue is abandoned
+# The critics, each backed by prompts/<role>.md. They run concurrently and every one must PASS.
+# Adding a role here and a prompt file is the whole of adding a reviewer.
+CRITICS=(review idiom tests)
 MAX_ISSUES="${MAX_ISSUES:-0}"       # 0 = run until the queue is empty
 TIMEOUT="${TIMEOUT:-30m}"           # wall clock per invocation
 # Bedrock model IDs, not the "opus"/"sonnet" aliases: the aliases only resolve via
@@ -163,6 +166,16 @@ critic() {
   say "  $tag: $(jq -r .verdict "$out") ($(jq -r '.findings|length' "$out") findings) cost=\$$(jq -r '.total_cost_usd // 0' "$LOGS/$tag.json")"
 }
 
+# critic_name <role> : what the fixer sees the findings attributed to
+critic_name() {
+  case "$1" in
+    review) printf 'correctness reviewer' ;;
+    idiom)  printf 'idiom critic' ;;
+    tests)  printf 'test critic' ;;
+    *)      printf '%s' "$1" ;;
+  esac
+}
+
 # findings_text <verdict-json...> : the findings as a flat list for the fixer
 findings_text() {
   jq -r '.findings[] | "- \(.file): \(.problem)\n  FIX: \(.fix)"' "$@"
@@ -226,8 +239,8 @@ while :; do
       say "  round $round: WARNING diff exceeds $MAX_DIFF_BYTES bytes — critics see a truncated diff"
     fi
 
-    # 3. Both critics, concurrently, on the same diff.
-    for role in review idiom; do
+    # 3. Every critic, concurrently, on the same diff.
+    for role in "${CRITICS[@]}"; do
       { cat "$HARNESS/prompts/$role.md"
         echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo
         echo "## What the implementer says it did"; echo; cat "$LOGS/$N-implement.txt"; echo
@@ -237,22 +250,32 @@ while :; do
     done
     wait
 
-    v_review=$(jq -r '.verdict' "$LOGS/$N-review-$round.verdict.json")
-    v_idiom=$(jq -r '.verdict' "$LOGS/$N-idiom-$round.verdict.json")
-    if [ "$v_review" = PASS ] && [ "$v_idiom" = PASS ]; then
+    # Unanimity, and it has to be unanimous the hard way: `critic` fails closed, so a crashed or
+    # truncated invocation is a FAIL and holds the issue back rather than waving it through.
+    all_pass=1
+    verdicts=""
+    for role in "${CRITICS[@]}"; do
+      v=$(jq -r '.verdict' "$LOGS/$N-$role-$round.verdict.json")
+      verdicts="$verdicts $role=$v"
+      [ "$v" = PASS ] || all_pass=0
+    done
+    if [ "$all_pass" = 1 ]; then
       approved=1
-      say "  round $round: both critics PASS"
+      say "  round $round: all ${#CRITICS[@]} critics PASS"
       break
     fi
 
-    # 4. Fix, then round again.
-    say "  round $round: review=$v_review idiom=$v_idiom — sending findings back"
+    # 4. Fix, then round again. Only the critics that actually found something get a section: an
+    # empty heading reads to the fixer as a reviewer with nothing to say, and this prompt's whole
+    # job is to be actionable.
+    say "  round $round:$verdicts — sending findings back"
     { cat "$HARNESS/prompts/fix.md"
       echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo
-      echo "## Blocking findings — correctness reviewer"; echo
-      findings_text "$LOGS/$N-review-$round.verdict.json"; echo
-      echo "## Blocking findings — idiom critic"; echo
-      findings_text "$LOGS/$N-idiom-$round.verdict.json"
+      for role in "${CRITICS[@]}"; do
+        [ "$(jq -r '.findings | length' "$LOGS/$N-$role-$round.verdict.json")" -gt 0 ] || continue
+        echo "## Blocking findings — $(critic_name "$role")"; echo
+        findings_text "$LOGS/$N-$role-$round.verdict.json"; echo
+      done
     } | work "$N-fix-$round"
   done
 
@@ -273,7 +296,7 @@ while :; do
     if [ -n "$NO_PUSH" ]; then
       say "#$N NO_PUSH set, leaving the issue open"
     else
-      gh issue close "$N" --comment "Implemented by the ArchUnitDev loop; both reviewers passed." >/dev/null \
+      gh issue close "$N" --comment "Implemented by the ArchUnitDev loop; all ${#CRITICS[@]} reviewers passed." >/dev/null \
         || say "WARNING: could not close #$N"
     fi
     say "#$N DONE"

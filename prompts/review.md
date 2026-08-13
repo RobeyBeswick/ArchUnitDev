@@ -37,27 +37,18 @@ implementations dressed up as complete ones are the thing to catch — a functio
 slice with a `// TODO`, a predicate that ignores one of its two moods, a terminal that never wires in
 the empty-test guard.
 
-**Are the tests real?** This is your highest-value work, because coverage cannot tell you and no linter
-can. A line can be 100% covered by a test that asserts nothing about it. Report:
+**The tests are not yours.** A third reviewer, the test critic, owns whether the tests would fail if
+the code were wrong — assertion-free tests, tautologies, unrealistic fixtures, weakened assertions, and
+missing coverage of the invariants below. It reviews the same diff you do, in parallel. Reporting a test
+finding here duplicates it, and the fixer then sees one problem described two ways in one prompt.
 
-- The only assertion is `if err != nil { t.Fatal(err) }`. That exercises the happy path and asserts no
-  behaviour.
-- A `want` field declared in the table struct and never read in the body.
-- The expected value computed by the same code path as the value under test. A tautology passes forever.
-- `len(got) > 0`, `!= nil` or `!= ""` as the sole check on a function that returns structured data.
-- An empty table, or a table with one trivial case, so the loop body never meaningfully runs.
-- `t.Log` where `t.Error` was meant.
-- An assertion inside a goroutine with no synchronisation, so the test can finish before it runs.
-- **A fixture that cannot physically produce the violation the test claims to check for.** This is the
-  single most valuable finding available in this repository, and coverage will report those lines as
-  covered. Read the fixture graph and check that it actually contains the shape under test.
-- A test asserting a rule *passes* where no test asserts it *fails*, or the reverse. Both moods need a
-  case, or half the predicate is untested.
-- Assertions loosened relative to what the diff changed — a range where there was an equality, a
-  substring match where there was a full comparison.
+Two exceptions, because they are judgements about the *code* rather than the tests:
 
-Pure code needs unit tests against hand-built fixture graphs; anything reaching the fluent API needs an
-integration test through the public surface.
+- Untested code on a path that matters, where the reason it is untestable is a design defect — a pure
+  function that reaches for the filesystem, or state hidden where no test can construct it. Report the
+  design defect, not the missing test.
+- An implementation that only works because a test was written to match its output rather than the
+  specified behaviour. That is a correctness finding about the code.
 
 **Are the data-model invariants respected?** From `AGENTS.md`:
 
