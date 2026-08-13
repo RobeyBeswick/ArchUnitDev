@@ -151,8 +151,15 @@ while :; do
 
   TITLE=$(gh issue view "$N" --json title --jq .title)
   BASE=$(git rev-parse HEAD)
-  gh issue view "$N" --comments > "$LOGS/issue-$N.md"
-  say "=== issue #$N: $TITLE (base $(git rev-parse --short "$BASE")) ==="
+  # Body first, then any comments. NOT `gh issue view --comments`, which shows the comments
+  # *instead of* the body and so silently yields an empty file on an uncommented issue.
+  gh issue view "$N" --json title,body,comments --jq \
+    '"# \(.title)\n\n\(.body)\n" + (if (.comments | length) > 0
+       then "\n## Comments\n" + ([.comments[] | "\n**\(.author.login):**\n\(.body)"] | join("\n"))
+       else "" end)' > "$LOGS/issue-$N.md"
+  body_bytes=$(wc -c < "$LOGS/issue-$N.md" | tr -d ' ')
+  say "=== issue #$N: $TITLE (base $(git rev-parse --short "$BASE"), ${body_bytes}b of description) ==="
+  [ "$body_bytes" -gt 80 ] || say "  WARNING: issue #$N has almost no description — the implementer is working from the title alone"
 
   { cat "$HARNESS/prompts/implement.md"
     echo "## Issue #$N: $TITLE"; echo
