@@ -58,6 +58,12 @@ Work in this order:
    identifiers, a self-edge per file, parallel edges merged with their import kinds unioned, globs
    compiled to regex in exactly one place, violations carrying data rather than prose, and zero
    matches being a violation rather than a pass.
+6. **Update the prose your change makes false, in the same diff.** When you add, remove or restrict an
+   exported symbol, grep the package's own doc comment, its sibling type docs and `archunit.go` for
+   sentences that count or bound the surface — "three exported functions", "the whole surface", "X's
+   exact twin", "only", "nothing else". A sentence like that in a file you did not otherwise touch is
+   still yours to fix, and it is the single most common reason a review round gets spent: five of the
+   six idiom blocks in the batch of #14-#26 were this, twice in the same package doc.
 
 ## Scope
 
