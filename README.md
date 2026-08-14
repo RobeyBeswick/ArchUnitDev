@@ -22,8 +22,8 @@ for the lowest-numbered open issue:
                       ├─ idiom critic │   │
                       │  test critic  ┴───┴──▶ all PASS? ───▶ commit, push, close issue
                       │                            │ no
-                      └────────── fixer ◀──────────┘   × MAX_ROUNDS
-                                                       │ exhausted
+                      └────────── fixer ◀──────────┘   × MAX_ROUNDS, then judge
+                                                       │ once more and stop
                                     park on abandoned/issue-N, label needs-human, move on
 
 once the batch is done, if RETRO=1:
@@ -134,9 +134,10 @@ with `check-blank` covers `_ =`, and `go vet`/`SA4011` cover `if false`. Both cr
 weakened check as always blocking, and the fixer is told that weakening `.golangci.yml` counts as
 weakening the checks.
 
-**Nothing is lost when an issue defeats the loop.** After `MAX_ROUNDS` the work is committed to
-`abandoned/issue-N`, pushed, and the target repo is reset to the base commit so the next issue starts
-from a clean tree.
+**Nothing is lost when an issue defeats the loop.** After `MAX_ROUNDS` fixes and a final judged round,
+the work is committed to `abandoned/issue-N`, pushed, and the target repo is reset to the base commit
+so the next issue starts from a clean tree. The commit message carries the reason and the verdicts its
+tip was judged on, because that branch is the handoff to whoever picks the issue up.
 
 ## Auth
 
@@ -308,7 +309,7 @@ All environment variables, all with defaults that work:
 |---|---|---|
 | `REPO` | `/work/repo` | Target repository. |
 | `LOGS` | `$HARNESS/logs` | Log directory. |
-| `MAX_ROUNDS` | `3` | Review/fix rounds before an issue is abandoned. |
+| `MAX_ROUNDS` | `3` | *Fix* rounds before an issue is abandoned. The loop runs one more judged round than this, so its last act on an issue is always a gate plus a verdict, never a fix nobody looked at. `MAX_ROUNDS=3` means at most 3 fixes and up to 4 rounds of critics. |
 | `MAX_ISSUES` | `0` | Issues to *attempt*, abandonments included — a bound on what the run touches and what it spends, not on how much of it lands. `0` = run until the queue is empty. Set to `1` for a smoke test. |
 | `MAX_CONSECUTIVE_ABANDONS` | `2` | Stop the run after this many issues are abandoned back to back, on the reasoning that a run of abandons is far more often a broken environment than several independently hard issues. `0` = never stop. |
 | `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. |
@@ -350,7 +351,8 @@ machinery. The scenarios are:
 | `fixround` | A critic returns `FAIL`; the finding's `problem` and `fix` text reach the fix prompt; round 2 re-reviews and lands. |
 | `testcritic` | Only the third critic objects: its findings reach the fixer attributed to it, and the two that passed contribute no empty section. |
 | `garbage` | A critic returns unparseable output: fail closed, with a synthesised finding, never a silent pass. |
-| `abandon` | `MAX_ROUNDS` exhausted: work parked on `abandoned/issue-N`, pushed, repo reset to base, issue labelled and skipped, run carries on. |
+| `abandon` | `MAX_ROUNDS` exhausted: work parked on `abandoned/issue-N`, pushed, repo reset to base, issue labelled and skipped, run carries on. Also that the issue's last invocation is a critic rather than a fixer, and that the parked branch's message records the verdict its tip was judged on. |
+| `late_pass` | The critics are satisfied only by the third fix, and the issue lands on the verdict taken after it. Bounded at `MAX_ROUNDS` *rounds* instead of fixes, this same work is parked as abandoned with a green gate and every finding addressed. |
 | `nodiff` | The implementer changes nothing: no critic and no fixer run, no commit, no empty branch, the issue is skipped and flagged, and the abandon line says *that* rather than blaming three rounds of review. |
 | `no_push` | `NO_PUSH=1` commits locally and touches nothing remote. |
 | `two_issues` | Two issues in one run: the queue advances, the second issue's base is the first one's commit, and each issue is implemented exactly once. |

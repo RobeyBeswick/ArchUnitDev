@@ -181,12 +181,26 @@ scenario_abandon() {
   run_loop always_fail
 
   want "$RC" "exits 0"
-  want_grep "ABANDONED — no unanimous PASS in 3 rounds" "$ROOT/run.out" \
-            "the issue was abandoned, and the reason given is the one that applies"
+  want_grep "ABANDONED — no unanimous PASS after 3 round(s) of fixes, the last of them reviewed" \
+            "$ROOT/run.out" "the issue was abandoned, and the reason given is the one that applies"
   for r in 1 2 3; do
     want_grep "2-fix-$r" "$STUB_DIR/calls" "fix round $r ran"
   done
   [ "$(grep -c '2-fix-' "$STUB_DIR/calls")" = 3 ]; want $? "exactly MAX_ROUNDS fix rounds ran"
+
+  # MAX_ROUNDS bounds the fixes, and one more round judges the last of them. Without that round the
+  # loop's final act is a fix nobody gates or reviews: paid for, then parked on a branch as though it
+  # had never happened. That is how the first long batch lost both of its abandoned issues.
+  for r in 1 2 3 4; do
+    want_grep "2-tests-$r" "$STUB_DIR/calls" "critics voted in round $r"
+  done
+  want_no_grep "2-fix-4" "$STUB_DIR/calls" "no fixer ran after the final verdict"
+  case "$(tail -1 "$STUB_DIR/calls")" in
+    2-review-4|2-idiom-4|2-tests-4) ok "the issue's last invocation was a critic, not a fixer" ;;
+    *) bad "the issue's last invocation was a critic, not a fixer (got $(tail -1 "$STUB_DIR/calls"))" ;;
+  esac
+  contains "Final round: review=FAIL" "$(git -C "$REPO" log -1 --format=%B abandoned/issue-2)"
+  want $? "the parked branch records the verdict its tip was judged on"
 
   git -C "$REPO" rev-parse --verify --quiet abandoned/issue-2 >/dev/null
   want $? "the work is parked on abandoned/issue-2"
@@ -353,6 +367,30 @@ scenario_breaker() {
   want "$RC" "MAX_CONSECUTIVE_ABANDONS=0 runs the queue out"
   want_grep "4-implement" "$STUB_DIR/calls" "every issue was attempted"
   want_grep "0 issue(s) landed, 3 abandoned" "$ROOT/run.out" "and the summary is accurate"
+}
+
+# The other half of the round bound: an issue whose last fix is the one that satisfies everybody. The
+# critics only pass once the third fix has landed, so the round that decides this issue is the verdict
+# taken after the final fix. It lands here; under a loop bounded at MAX_ROUNDS *rounds* the same work
+# is parked on abandoned/issue-2 with a green gate and every finding addressed, and a human is asked
+# to re-derive it. That was 24% of the first long batch's spend.
+scenario_late_pass() {
+  setup
+  run_loop late_pass NO_PUSH=1
+
+  want "$RC" "exits 0"
+  want_grep "round 4: all 3 critics PASS" "$ROOT/run.out" "the verdict after the last fix is taken"
+  want_grep "#2 DONE" "$ROOT/run.out" "and the issue lands on it"
+  want_no_grep "ABANDONED" "$ROOT/run.out" "the work is not abandoned with the critics satisfied"
+  want_grep "2-fix-3" "$STUB_DIR/calls" "the third fix ran"
+  want_no_grep "2-fix-4" "$STUB_DIR/calls" "and no fourth, MAX_ROUNDS being a bound on fixes"
+  [ "$(commits)" = 2 ]; want $? "the work is committed"
+  contains "feature-2.txt" "$(in_head feature-2.txt && echo feature-2.txt)"
+  want $? "and the implementation is in the commit"
+  git -C "$REPO" rev-parse --verify --quiet abandoned/issue-2 >/dev/null \
+    && bad "work that passed was also parked as abandoned" \
+    || ok "nothing was parked as abandoned"
+  want_grep "1 issue(s) landed, 0 abandoned" "$ROOT/run.out" "the summary is accurate"
 }
 
 # MAX_ISSUES bounds the issues a run attempts, including the ones it gives up on. An operator sets it
@@ -567,7 +605,7 @@ scenario_retro() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon nodiff no_push two_issues bounded pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
+ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then

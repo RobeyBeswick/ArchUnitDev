@@ -98,6 +98,6 @@ That note is the only record a human will see. A reviewer will block undocumente
 ## Then stop
 
 When the code and tests are in place and the checks are clean, write a two-or-three-line summary of
-what you built and where it lives. That summary is read by two reviewers who see only your diff.
+what you built and where it lives. That summary is read by three reviewers who see only your diff.
 
 ---
