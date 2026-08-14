@@ -23,7 +23,7 @@ variable "instance_type" {
 }
 
 variable "volume_size" {
-  description = "GB. The image is ~1.9GB, plus the Go module and build caches, the clone, and the logs."
+  description = "GB. The image is ~1.5GB, plus the Docker build cache, the Go caches, the clones and the logs."
   type        = number
   default     = 30
 }

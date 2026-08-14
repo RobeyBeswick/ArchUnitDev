@@ -60,25 +60,34 @@ would cost more per month than the rest of the plumbing is worth defending.
 
 ## 3. Build the image and push it
 
-The image is not in the registry until you put it there. It has to be built somewhere the Go module
-proxy resolves — `proxy.golang.org` is blocked on the network this repository is developed on, so
-either use `GOPROXY=direct` locally, or build on the instance itself, which has clean egress:
+The image is not in the registry until you put it there, and **building on the instance is the
+recommended path**, not the fallback. Two reasons, both learned the hard way: `proxy.golang.org` is
+blocked on the network this repository is developed on but resolves fine from the instance, and a
+laptop is likely the wrong architecture — an arm64 Mac produces an image a `t3.medium` cannot run, and
+cross-building it under emulation takes about ten times as long as building it natively in the VPC.
+The bootstrap clones this repository to `$HARNESS_DIR` for exactly this, so on the instance:
 
 ```bash
-# locally, if proxy.golang.org is blocked but go.googlesource.com is not
-docker build --build-arg GOPROXY=direct -t archunitdev .
-
-# then, with the terraform output
-REPO=$(terraform -chdir=deploy/terraform output -raw ecr_repository_url)
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "${REPO%%/*}"
-docker tag archunitdev "$REPO:latest"
-docker push "$REPO:latest"
+docker build -t archunitdev "$HARNESS_DIR"    # ~3 minutes, no --build-arg needed
 ```
 
-Building on the instance is the simpler path if the local network fights you: the harness repository is
-not cloned there by the bootstrap (only the target repo is), so clone it, `docker build`, and skip the
-registry entirely — the image only ever needs to exist on the one host that runs it. ECR is there so
-the same image can be rebuilt and pushed from a machine with a working network.
+That is all the loop needs — the image only ever has to exist on the one host that runs it. Push it to
+ECR as well if you want a rebuilt instance to pull rather than rebuild:
+
+```bash
+REPO=${IMAGE%:*}
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "${REPO%%/*}"
+docker tag archunitdev "$IMAGE" && docker push "$IMAGE"
+```
+
+Building from a laptop with a working network and the right architecture still works, with
+`docker build --build-arg GOPROXY=direct -t archunitdev .` if the module proxy is blocked there.
+
+One thing to know if you change the base image: **`apt` is pointed at HTTPS in the Dockerfile on
+purpose.** The security group allows outbound 443 and nothing else, and Debian's default mirror URL is
+`http://`, so an `apt-get` over port 80 does not fail fast — it hangs until apt gives up and takes the
+build with it, two minutes in. `deb.debian.org` serves both, and the fix belongs in the image rather
+than in the security group.
 
 ## 4. Get on the box, and give it the token
 
@@ -90,13 +99,21 @@ Needs the Session Manager plugin locally (`brew install --cask session-manager-p
 session is refused, the instance is still booting — the SSM agent registers a minute or two after the
 instance reports running.
 
-Create the token secret once, from your own machine. A fine-grained PAT scoped to the one repository
-with contents and issues write is enough; a classic `repo` token is far more than the loop needs:
+Create the token secret once, from your own machine. It has to be a **classic** PAT with the `repo`
+scope, and that is not laziness about scoping down: the target repository is owned by another account
+and reached as a collaborator, and a fine-grained token is scoped by *resource owner* — it can only
+ever reach repositories owned by the account that issued it, so it cannot see this one at all. A
+classic PAT carries the access its owner has. Give it the shortest expiry that covers the run.
 
 ```bash
+# the account matters and there is no --account flag: identity comes from the credentials in use
+aws sts get-caller-identity --query Account --output text     # expect <aws-account-id>
 aws secretsmanager create-secret --region us-east-1 \
-  --name archunitdev/gh-token --secret-string 'github_pat_...'
+  --name archunitdev/gh-token --secret-string 'ghp_...'
 ```
+
+Add the `workflow` scope only if a run will touch `.github/workflows/` — GitHub rejects such a push
+without it. Nothing in the backlog needs it except issue #43.
 
 On the instance, the bootstrap left the names in `/etc/profile.d/archunitdev.sh`, so:
 
@@ -120,9 +137,24 @@ docker run --rm -e GH_TOKEN -e PREFLIGHT_ONLY=1 \
 
 Costs nothing. You want `auth: Bedrock in us-east-1 as arn:aws:sts::…:assumed-role/archunitdev-loop/…`
 and **no** static-credentials warning. Seeing `assumed-role/archunitdev-loop` is the proof that the
-instance profile — not a leftover environment variable — is what answered. It is also the test for
-whether the Bedrock interface endpoint can serve the *global* inference profile: if inference fails
-here but works with `bedrock_vpc_endpoint = false`, that is why.
+instance profile — not a leftover environment variable — is what answered.
+
+It is *not* proof that inference works: that line comes from `sts get-caller-identity`, which resolves
+credentials without calling Bedrock at all. The one assumption in this stack worth proving rather than
+trusting is whether a regional PrivateLink endpoint can serve a *global* inference profile — the pinned
+model is `global.anthropic.claude-opus-5`, which routes across regions server-side. One real call
+settles it, for a fraction of a cent:
+
+```bash
+docker run --rm --entrypoint bash archunitdev -lc \
+  'getent hosts bedrock-runtime.us-east-1.amazonaws.com; \
+   claude --model global.anthropic.claude-opus-5 -p "Reply with exactly: OK"'
+```
+
+A `10.0.1.x` address for the hostname means DNS is resolving to the interface endpoint inside the
+private subnet rather than to a public one, and a reply after it means the global profile is served
+through it. Both hold as of 2026-08-14. If inference fails here but works with
+`bedrock_vpc_endpoint = false`, that is the assumption breaking.
 
 ## 6. Run it
 
@@ -245,14 +277,15 @@ If you do apply a policy somewhere that can express hostnames, this is the list:
 | `proxy.golang.org`, `sum.golang.org` | The gate runs `go build`, and the extractor depends on `golang.org/x/tools`. |
 | `*.amazonaws.com` | SSM for the shell, ECR for the image, S3 for the logs, Secrets Manager for the token. |
 | `raw.githubusercontent.com`, `objects.githubusercontent.com` | **`docker build` only.** The `golangci-lint` install script and the release tarball it fetches. Not needed once the image exists. |
+| `deb.debian.org`, `claude.ai` | **`docker build` only.** The base image's packages and the Claude Code installer. The Dockerfile rewrites the Debian mirror to `https://` so this stays inside the 443 rule; see section 3. |
 
 Not needed: `api.anthropic.com`. Inference goes to Bedrock.
 
 ## Instance sizing
 
 The loop is almost entirely waiting on the API. Two vCPUs is plenty — the only real work is `go build`
-and `go test` in the gate. Disk matters more than CPU: the image is ~2.1GB, plus the Go module cache
-and the logs, so give it 30GB.
+and `go test` in the gate. Disk matters more than CPU: the image is ~1.5GB built on the instance
+(~2.1GB for the arm64 build on a Mac), plus the Go module and build caches and the logs, so give it 30GB.
 
 Memory is the one thing worth checking rather than assuming. The gate runs `go test -race`, and the race
 detector costs roughly 5–10× the memory of a plain test binary, on top of `golangci-lint`, which type-checks
