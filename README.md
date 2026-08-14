@@ -270,6 +270,7 @@ All environment variables, all with defaults that work:
 | `LOGS` | `$HARNESS/logs` | Log directory. |
 | `MAX_ROUNDS` | `3` | Review/fix rounds before an issue is abandoned. |
 | `MAX_ISSUES` | `0` | `0` = run until the queue is empty. Set to `1` for a smoke test. |
+| `MAX_CONSECUTIVE_ABANDONS` | `2` | Stop the run after this many issues are abandoned back to back, on the reasoning that a run of abandons is far more often a broken environment than several independently hard issues. `0` = never stop. |
 | `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. |
 | `NO_PUSH` | unset | Commit locally, but do not push and do not close the issue. Use it for the first run. The issue is recorded in `logs/landed` so the queue still advances. |
 | `TIMEOUT` | `30m` | Wall clock per invocation. |
