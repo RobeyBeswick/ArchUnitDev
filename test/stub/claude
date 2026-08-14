@@ -24,6 +24,12 @@ mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/$tag.stdin"
 printf '%s\n' "$tag" >> "$STUB_DIR/calls"
 
+# Whether the GitHub token reached this invocation. It is the harness's one enforced boundary — the
+# prompts ask the implementer not to push, `env -u GH_TOKEN` is what makes it impossible — so it is
+# worth an assertion rather than a comment. Recorded per tag, because "stripped for the critics but
+# not the fixer" is exactly the kind of regression a single check would miss.
+printf '%s %s\n' "$tag" "${GH_TOKEN:-(unset)}" >> "$STUB_DIR/tokens"
+
 round="${tag##*-}"   # meaningless for "*-implement", unused there
 issue="${tag%%-*}"
 
@@ -113,6 +119,16 @@ case "$tag" in
         fi ;;
       *) verdict_pass ;;
     esac
+    ;;
+
+  retro-*)
+    # The retrospective. Its output is markdown for a human, not a schema, so the only thing the
+    # stub has to be faithful about is where it comes back: `.result`.
+    result "## Verdict
+The loop landed the batch in one round each. No change needed.
+
+## Findings
+None worth making from a batch this size."
     ;;
 
   *)
