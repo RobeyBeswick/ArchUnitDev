@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+#
+# First-boot bootstrap for the loop host. Runs once, as root; its output is in
+# /var/log/cloud-init-output.log, which is the first place to look if the instance comes up unusable.
+#
+# It deliberately stops short of starting the loop. A run costs real money and commits to a night of
+# unattended work, so it is started by a human who has seen a PREFLIGHT_ONLY=1 pass.
+set -euxo pipefail
+
+dnf install -y docker git
+systemctl enable --now docker
+usermod -aG docker ec2-user
+
+# Both are bind-mounted into the container, and a bind mount carries the host's ownership straight
+# through: the image runs as uid 1000, which is ec2-user here, so anything cloned or created as
+# ec2-user is writable by the loop and anything created as root is not.
+install -d -o ec2-user -g ec2-user /home/ec2-user/logs
+if [ ! -d /home/ec2-user/ArchUnitGo ]; then
+  sudo -u ec2-user git clone ${target_repo} /home/ec2-user/ArchUnitGo
+fi
+
+aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${registry}
+docker pull ${image} \
+  || echo "bootstrap: ${image} is not in the registry yet. Build and push it, then pull it by hand."
+
+# The values the operator's commands need, so none of them has to be typed from memory at 22:00.
+cat > /etc/profile.d/archunitdev.sh <<'PROFILE'
+export IMAGE="${image}"
+export S3_LOGS="s3://${log_bucket}/loop"
+export GH_TOKEN_SECRET="${gh_token_secret_name}"
+export REPO_DIR="/home/ec2-user/ArchUnitGo"
+export LOGS_DIR="/home/ec2-user/logs"
+PROFILE
+chmod 0644 /etc/profile.d/archunitdev.sh
+
+echo "bootstrap: done. Connect with Session Manager and see deploy/README.md section 5."
