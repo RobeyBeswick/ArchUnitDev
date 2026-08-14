@@ -80,37 +80,55 @@ trap 'rm -f "$pack"' EXIT
     outcome="landed and pushed"
     grep -qx "$N" "$LOGS/landed"  2>/dev/null && outcome="landed, issue left open (NO_PUSH)"
     grep -qx "$N" "$LOGS/skipped" 2>/dev/null && outcome="ABANDONED — no unanimous pass"
+    # An issue with two attempts is worth flagging in the heading rather than leaving to be inferred
+    # from the round tables below: whether the second attempt was worth its money is a question about
+    # the loop, which is what this whole exercise is for.
+    if [ -f "$LOGS/$N-retry-implement.json" ]; then
+      case "$outcome" in
+        ABANDONED*) outcome="$outcome, twice — abandoned, re-attempted on a later base, abandoned again" ;;
+        *)          outcome="$outcome, but only on the re-attempt: the first attempt of it was abandoned" ;;
+      esac
+    fi
 
+    # The glob spans both attempts, which is the honest total: what the issue cost this batch.
     cost=$(jq -s '[.[].total_cost_usd // 0] | add' "$LOGS/$N-"*.json 2>/dev/null)
     printf '## Issue #%s — %s\n' "$N" "${title:-(no issue-$N.md)}"
     printf 'Outcome: %s. Total spend: $%s. Description: %s bytes.\n' \
       "$outcome" "${cost:-0}" "$(wc -c < "$LOGS/issue-$N.md" 2>/dev/null | tr -d ' ')"
 
-    for round in $(seq 1 "$MAX_ROUNDS"); do
-      [ -f "$LOGS/$N-gate-$round.txt" ] || continue
+    for TAG in "$N" "$N-retry"; do
+    [ -f "$LOGS/$TAG-implement.json" ] || continue
+    [ "$TAG" = "$N" ] || printf '\nRe-attempted from scratch on a later base, the first attempt having been abandoned:\n'
+    # MAX_ROUNDS + 1, because that is how many rounds run.sh runs: the extra one is the verdict taken
+    # after the last fix, and it is the round that decides every abandoned issue. Walking to MAX_ROUNDS
+    # instead drops it — so the retrospective would see an issue's last fix and none of the judgement
+    # on it, which is the opposite of what the round is for.
+    for round in $(seq 1 $((MAX_ROUNDS + 1))); do
+      [ -f "$LOGS/$TAG-gate-$round.txt" ] || continue
       # The gate is clean exactly when the diff for that round exists: run.sh writes the diff only
       # after the gate passes, and jumps straight to the fixer when it does not.
-      if [ -f "$LOGS/$N-diff-$round.patch" ]; then
+      if [ -f "$LOGS/$TAG-diff-$round.patch" ]; then
         gate="clean"
       else
         gate="FAILED"
-        violations=$(grep -c 'VIOLATION' "$LOGS/$N-gate-$round.txt" 2>/dev/null | tr -d ' ')
+        violations=$(grep -c 'VIOLATION' "$LOGS/$TAG-gate-$round.txt" 2>/dev/null | tr -d ' ')
         [ "${violations:-0}" -gt 0 ] && gate="FAILED ($violations VIOLATION line(s); the rest is build/test output — read the file)"
       fi
       printf '* round %s: gate %s' "$round" "$gate"
-      if [ -f "$LOGS/$N-diff-$round.patch" ]; then
+      if [ -f "$LOGS/$TAG-diff-$round.patch" ]; then
         printf ', diff %s bytes over %s file(s)' \
-          "$(wc -c < "$LOGS/$N-diff-$round.patch" | tr -d ' ')" \
-          "$(grep -c '^+++ ' "$LOGS/$N-diff-$round.patch" 2>/dev/null | tr -d ' ')"
+          "$(wc -c < "$LOGS/$TAG-diff-$round.patch" | tr -d ' ')" \
+          "$(grep -c '^+++ ' "$LOGS/$TAG-diff-$round.patch" 2>/dev/null | tr -d ' ')"
       fi
       for role in "${CRITICS[@]}"; do
-        v="$LOGS/$N-$role-$round.verdict.json"
+        v="$LOGS/$TAG-$role-$round.verdict.json"
         [ -f "$v" ] || continue
         printf ' | %s %s (%s finding(s))' \
           "$role" "$(jq -r '.verdict // "?"' "$v")" "$(jq -r '.findings | length' "$v" 2>/dev/null)"
       done
-      [ -f "$LOGS/$N-fix-$round.json" ] && printf ' | fixer ran'
+      [ -f "$LOGS/$TAG-fix-$round.json" ] && printf ' | fixer ran'
       printf '\n'
+    done
     done
     printf '\n'
   done

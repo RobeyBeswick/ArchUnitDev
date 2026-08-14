@@ -6,6 +6,10 @@
 #   implement  ->  [ deterministic gate  ->  reviewer + idiom critic  ->  fix ] x MAX_ROUNDS
 #              ->  commit, push, close the issue
 #
+# Then, once the queue is done, one more attempt at each issue this run abandoned — against the tree
+# the batch finished on rather than the one it failed against. The backlog is in dependency order, so
+# an abandonment leaves a hole with everything after it landing on top.
+#
 # State lives in git and in the GitHub issues. There is no database and no resume logic:
 # the next issue is always "the lowest-numbered open one", so a killed run is restarted
 # by running this script again.
@@ -40,6 +44,7 @@ FALLBACK_MODEL="${FALLBACK_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-400000}"
 NO_PUSH="${NO_PUSH:-}"              # set to 1 to commit locally but not push or close issues
 MAX_CONSECUTIVE_ABANDONS="${MAX_CONSECUTIVE_ABANDONS:-2}"   # stop the run after this many in a row; 0 = never stop
+RETRY_ABANDONED="${RETRY_ABANDONED:-1}"   # re-attempt abandoned issues once the batch has grown under them; empty = off
 
 SCHEMA="$(cat "$HARNESS/schema/verdict.json")"
 SKIPPED="$LOGS/skipped"          # abandoned: got no further after MAX_ROUNDS, needs a human
@@ -49,6 +54,18 @@ touch "$SKIPPED" "$LANDED"
 
 say() { printf '%s  %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$LOGS/run.log"; }
 die() { say "FATAL: $*"; exit 1; }
+
+# The skipped list, written once and unwritten when an issue stops needing a human. Both of these
+# exist because the file is read as a set — by the queue, and by the retrospective to label an
+# outcome — so a duplicate entry is a miscount and a stale one is a lie.
+record_skipped() { grep -qx "$1" "$SKIPPED" 2>/dev/null || echo "$1" >> "$SKIPPED"; }
+# awk, not `grep -v`: grep exits 1 when it selects no lines, so the idiomatic
+# `grep -v "$1" f > tmp && mv tmp f` silently does nothing to a file whose every line matches — and a
+# one-line skipped list being cleared is exactly the case that matters here.
+forget_skipped() {
+  grep -qx "$1" "$SKIPPED" 2>/dev/null || return 0
+  awk -v n="$1" '$0 != n' "$SKIPPED" > "$SKIPPED.tmp" && mv "$SKIPPED.tmp" "$SKIPPED"
+}
 
 # --- preflight -------------------------------------------------------------------
 # Every check here is something that otherwise fails silently or halfway through the night.
@@ -271,6 +288,15 @@ attempted=0
 # batch, so it needs the list rather than the count.
 attempted_issues=()
 consecutive_abandons=0
+retried=0
+retry_landed=0
+# Issues abandoned in the main pass, as "<number> <base>", to re-attempt once the queue has moved on.
+# The base is recorded with the number because it is what makes the re-attempt worth paying for: see
+# the retry phase below.
+retry_queue=()
+retry_count=0
+retry_index=0
+phase=main
 while :; do
   # Issues *attempted*, not issues landed. Gating on the landed count sounds equivalent and is not:
   # every abandonment buys the run another issue, so a bounded batch quietly outgrows the range the
@@ -279,7 +305,16 @@ while :; do
   # when you want to read the logs, not spend again. What this knob bounds is what the run touches
   # and what it costs, and an abandonment costs the most of all: an implement, MAX_ROUNDS of fixes,
   # and every critic in between.
-  [ "$MAX_ISSUES" -gt 0 ] && [ "$attempted" -ge "$MAX_ISSUES" ] && { say "hit MAX_ISSUES=$MAX_ISSUES"; break; }
+  #
+  # It bounds the main pass rather than the run, because a re-attempt of an abandoned issue adds
+  # nothing to the set of issues the operator scoped: #21 re-attempted is still #21. Ending the main
+  # pass here instead of ending the run is what lets a bounded batch — which is how this is actually
+  # run, MAX_ISSUES=12 over #14-#25 — retry at all. Bounding the run instead means the retry phase is
+  # unreachable in every batch that fills its bound, which is every batch that goes well.
+  if [ "$phase" = main ] && [ "$MAX_ISSUES" -gt 0 ] && [ "$attempted" -ge "$MAX_ISSUES" ]; then
+    say "hit MAX_ISSUES=$MAX_ISSUES"
+    phase=retry
+  fi
 
   # Two circuit breakers, both aimed at the same failure: the environment breaks partway through a
   # long queue and the loop keeps going, abandoning every remaining issue for a reason that has
@@ -307,12 +342,66 @@ while :; do
   # NO_PUSH night continues the queue instead of redoing the commits already on your local main.
   # (the lists are read in BEGIN rather than as leading file arguments: the NR==FNR idiom
   #  silently swallows the whole queue when the first file is empty)
-  N=$(gh issue list --state open --limit 300 --json number --jq '[.[].number] | sort | .[]' \
-      | awk -v sf="$SKIPPED" -v lf="$LANDED" \
-          'BEGIN { while ((getline l < sf) > 0) skip[l]
-                   while ((getline l < lf) > 0) skip[l] } !($0 in skip)' \
-      | head -1)
-  [ -n "$N" ] || { say "no open issues left — done"; break; }
+  if [ "$phase" = main ]; then
+    N=$(gh issue list --state open --limit 300 --json number --jq '[.[].number] | sort | .[]' \
+        | awk -v sf="$SKIPPED" -v lf="$LANDED" \
+            'BEGIN { while ((getline l < sf) > 0) skip[l]
+                     while ((getline l < lf) > 0) skip[l] } !($0 in skip)' \
+        | head -1)
+    [ -n "$N" ] || { say "no open issues left in the main pass"; phase=retry; }
+  fi
+
+  # The retry phase. The backlog is numbered in dependency order and the loop resets to main and moves
+  # on when an issue is abandoned, so an abandonment leaves a *hole in the middle of an ordered queue*
+  # while everything after it keeps landing on top. That is not hypothetical: #21 (an unimplemented
+  # Files API terminal) abandoned, #22-#26 landed over it, and the tree ended the batch with five
+  # commits of kernel under a gap that the issue itself had been the prerequisite for.
+  #
+  # So an abandoned issue gets exactly one more attempt, at the end, against the tree the batch
+  # actually finished on. Three properties make that cheap rather than a licence to spend twice:
+  #
+  #   - Only issues *this run* abandoned. An entry already in the skipped list is one a human parked,
+  #     or one a previous run gave up on, and re-attempting it is that human's call to make.
+  #   - Only when the base moved. If nothing landed after the issue, the re-attempt runs the same
+  #     prompts over the same tree and fails the same way for the same reason — so it is skipped, and
+  #     the pathological case where every issue abandons therefore retries nothing and costs nothing.
+  #   - Once. A retried issue that abandons again is not queued a third time.
+  #
+  # It does not run at all after the consecutive-abandon breaker: that path calls die(), because a
+  # broken environment is the one situation where spending again is certainly wrong.
+  if [ "$phase" = retry ]; then
+    N=""
+    while [ -n "$RETRY_ABANDONED" ] && [ "$retry_index" -lt "$retry_count" ]; do
+      entry="${retry_queue[$retry_index]}"
+      retry_index=$((retry_index + 1))
+      candidate="${entry%% *}"; candidate_base="${entry##* }"
+      if [ "$(git rev-parse HEAD)" = "$candidate_base" ]; then
+        say "retry: leaving #$candidate alone — nothing landed after it, so a re-attempt would run against the same tree it already failed on"
+        continue
+      fi
+      # A human may have closed it, or done the work by hand, in the hours since it was abandoned.
+      # Separators normalised in the shell rather than by the --jq expression, and not piped into
+      # `grep -q`: grep exits at the first match, gh takes SIGPIPE, and under pipefail the pipeline
+      # reports 141 — which would read here as "not open" and silently skip every retry.
+      open_now=$(gh issue list --state open --limit 300 --json number --jq '.[].number' | tr '\n' ' ')
+      case " $open_now " in
+        *" $candidate "*) ;;
+        *) say "retry: leaving #$candidate alone — it is no longer open"; continue ;;
+      esac
+      N="$candidate"
+      break
+    done
+    [ -n "$N" ] || { say "nothing further to attempt — done"; break; }
+    attempt=2
+    # The artifacts of the two attempts must not share filenames: the first attempt's gate output,
+    # diffs and verdicts are the evidence a human reads to decide whether the retry was even the right
+    # idea, and overwriting them in place would destroy exactly that.
+    TAG="$N-retry"
+    retried=$((retried + 1))
+  else
+    attempt=1
+    TAG="$N"
+  fi
 
   TITLE=$(gh issue view "$N" --json title --jq .title)
   BASE=$(git rev-parse HEAD)
@@ -323,13 +412,21 @@ while :; do
        then "\n## Comments\n" + ([.comments[] | "\n**\(.author.login):**\n\(.body)"] | join("\n"))
        else "" end)' > "$LOGS/issue-$N.md"
   body_bytes=$(wc -c < "$LOGS/issue-$N.md" | tr -d ' ')
-  say "=== issue #$N: $TITLE (base $(git rev-parse --short "$BASE"), ${body_bytes}b of description) ==="
+  if [ "$attempt" -gt 1 ]; then
+    say "=== issue #$N RE-ATTEMPT: $TITLE (base $(git rev-parse --short "$BASE"), was abandoned on $(git rev-parse --short "$candidate_base")) ==="
+  else
+    say "=== issue #$N: $TITLE (base $(git rev-parse --short "$BASE"), ${body_bytes}b of description) ==="
+  fi
   [ "$body_bytes" -gt 80 ] || say "  WARNING: issue #$N has almost no description — the implementer is working from the title alone"
 
+  # A fresh implementer, told nothing about the attempt that was abandoned. Feeding it the first
+  # attempt's diff and findings would make this a fourth fix round rather than a second attempt, and
+  # the round it would resume is the one that had already stopped converging. What has actually changed
+  # is the tree underneath it, which it reads for itself.
   { cat "$HARNESS/prompts/implement.md"
     echo "## Issue #$N: $TITLE"; echo
     cat "$LOGS/issue-$N.md"
-  } | work "$N-implement"
+  } | work "$TAG-implement"
 
   approved=0
   # Why the round loop stopped, when it stopped for a reason other than running out of rounds. It
@@ -356,7 +453,7 @@ while :; do
 
     # 1. Deterministic gate. Never spend model tokens reviewing code that does not build.
     # BASE lets the gate notice a deleted test; LOGS keeps the coverage profile out of the repo.
-    if ! REPO="$REPO" BASE="$BASE" LOGS="$LOGS" "$HARNESS/gate.sh" > "$LOGS/$N-gate-$round.txt" 2>&1; then
+    if ! REPO="$REPO" BASE="$BASE" LOGS="$LOGS" "$HARNESS/gate.sh" > "$LOGS/$TAG-gate-$round.txt" 2>&1; then
       say "  round $round: gate failed"
       if [ "$round" -eq "$final_round" ]; then
         abandon_reason="the gate was still failing after $MAX_ROUNDS round(s) of fixes"
@@ -364,21 +461,21 @@ while :; do
       fi
       { cat "$HARNESS/prompts/fix.md"
         echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo
-        echo "## Failing checks"; echo '```'; cat "$LOGS/$N-gate-$round.txt"; echo '```'
-      } | work "$N-fix-$round"
+        echo "## Failing checks"; echo '```'; cat "$LOGS/$TAG-gate-$round.txt"; echo '```'
+      } | work "$TAG-fix-$round"
       continue
     fi
     say "  round $round: gate clean"
 
     # 2. The diff the critics judge. Staged so that newly created files are included.
     git add -A
-    git diff --cached "$BASE" > "$LOGS/$N-diff-$round.patch"
-    if [ ! -s "$LOGS/$N-diff-$round.patch" ]; then
+    git diff --cached "$BASE" > "$LOGS/$TAG-diff-$round.patch"
+    if [ ! -s "$LOGS/$TAG-diff-$round.patch" ]; then
       say "  round $round: empty diff — the implementer changed nothing"
       abandon_reason="the implementer changed nothing on round $round, so there was nothing to review"
       break
     fi
-    if [ "$(wc -c < "$LOGS/$N-diff-$round.patch")" -gt "$MAX_DIFF_BYTES" ]; then
+    if [ "$(wc -c < "$LOGS/$TAG-diff-$round.patch")" -gt "$MAX_DIFF_BYTES" ]; then
       say "  round $round: WARNING diff exceeds $MAX_DIFF_BYTES bytes — critics see a truncated diff"
     fi
 
@@ -386,10 +483,10 @@ while :; do
     for role in "${CRITICS[@]}"; do
       { cat "$HARNESS/prompts/$role.md"
         echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo
-        echo "## What the implementer says it did"; echo; cat "$LOGS/$N-implement.txt"; echo
+        echo "## What the implementer says it did"; echo; cat "$LOGS/$TAG-implement.txt"; echo
         echo "## The diff under review (since $BASE)"; echo '```diff'
-        head -c "$MAX_DIFF_BYTES" "$LOGS/$N-diff-$round.patch"; echo '```'
-      } | critic "$N-$role-$round" "$LOGS/$N-$role-$round.verdict.json" &
+        head -c "$MAX_DIFF_BYTES" "$LOGS/$TAG-diff-$round.patch"; echo '```'
+      } | critic "$TAG-$role-$round" "$LOGS/$TAG-$role-$round.verdict.json" &
     done
     wait
 
@@ -398,7 +495,7 @@ while :; do
     all_pass=1
     verdicts=""
     for role in "${CRITICS[@]}"; do
-      v=$(jq -r '.verdict' "$LOGS/$N-$role-$round.verdict.json")
+      v=$(jq -r '.verdict' "$LOGS/$TAG-$role-$round.verdict.json")
       verdicts="$verdicts $role=$v"
       [ "$v" = PASS ] || all_pass=0
     done
@@ -420,11 +517,11 @@ while :; do
     { cat "$HARNESS/prompts/fix.md"
       echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo
       for role in "${CRITICS[@]}"; do
-        [ "$(jq -r '.findings | length' "$LOGS/$N-$role-$round.verdict.json")" -gt 0 ] || continue
+        [ "$(jq -r '.findings | length' "$LOGS/$TAG-$role-$round.verdict.json")" -gt 0 ] || continue
         echo "## Blocking findings — $(critic_name "$role")"; echo
-        findings_text "$LOGS/$N-$role-$round.verdict.json"; echo
+        findings_text "$LOGS/$TAG-$role-$round.verdict.json"; echo
       done
-    } | work "$N-fix-$round"
+    } | work "$TAG-fix-$round"
   done
 
   # --- land it, or hand it to a human ---
@@ -438,12 +535,21 @@ while :; do
     # loop before any critic runs — so if it happens the interesting thing is why, and closing the
     # issue would destroy the evidence and the issue with it.
     say "#$N WARNING: all critics approved but the tree matches base. Leaving the issue OPEN and skipping it: an issue is not resolved by an approval with no commit behind it."
-    echo "$N" >> "$SKIPPED"
+    record_skipped "$N"
     consecutive_abandons=$((consecutive_abandons + 1))
   elif [ "$approved" = 1 ]; then
     git commit -q -m "$TITLE" -m "Closes #$N" -m "Implemented by the ArchUnitDev loop." \
       || die "commit failed for #$N"
     landed_as=$(git rev-parse --short HEAD)
+    # An issue that landed does not need a human, whatever an earlier attempt of it concluded. Left in
+    # place, the entry would outlive its reason twice over: the final count would report the issue as
+    # abandoned, and the retrospective labels an outcome from this file, so a landed issue would be
+    # written up as ABANDONED with its own passing verdicts sitting next to the claim.
+    if [ "$attempt" -gt 1 ]; then
+      forget_skipped "$N"
+      retry_landed=$((retry_landed + 1))
+      say "#$N landed on the re-attempt — the first attempt's work is still on abandoned/issue-$N"
+    fi
     if [ -n "$NO_PUSH" ]; then
       # Recorded so the queue moves on: see the comment on LANDED above.
       echo "$N" >> "$LANDED"
@@ -474,6 +580,10 @@ while :; do
     say "#$N ABANDONED — ${abandon_reason:-no unanimous PASS in $MAX_ROUNDS rounds} — leaving the issue open"
     if ! git diff --cached --quiet "$BASE"; then
       branch="abandoned/issue-$N"
+      # A second attempt gets its own ref. `git branch -f` on the same name would move the first
+      # attempt's branch to the second attempt's tip, and since the first attempt's commit is by then
+      # unreachable from anything, the work a human was explicitly left would be gone.
+      [ "$attempt" -gt 1 ] && branch="abandoned/issue-$N-attempt-$attempt"
       # The reason and the final verdicts go in the message, because this branch is the handoff: the
       # tip has been gated and judged, so whoever picks it up should be told what the last word on it
       # actually was rather than having to go back to the log directory for it.
@@ -489,14 +599,28 @@ while :; do
         || gh issue comment "$N" --body "The ArchUnitDev loop could not get this past review in $MAX_ROUNDS rounds. Needs a human." >/dev/null 2>&1 \
         || say "WARNING: could not annotate #$N"
     fi
-    echo "$N" >> "$SKIPPED"
+    record_skipped "$N"
     consecutive_abandons=$((consecutive_abandons + 1))
+    # Queued for one more attempt at the end of the run, against whatever the batch lands over it. The
+    # base is recorded here rather than looked up later because by then HEAD has moved: the question
+    # the retry phase asks is whether it moved *since this issue failed*, and this is the only place
+    # that commit is still known.
+    if [ "$phase" = main ] && [ -n "$RETRY_ABANDONED" ]; then
+      retry_queue+=("$N $BASE")
+      retry_count=$((retry_count + 1))
+    fi
   fi
   attempted=$((attempted + 1))
-  attempted_issues+=("$N")
+  # Once per issue, not once per attempt: this list is what the retrospective is given as the batch,
+  # and a duplicate number would have it write the same issue up twice.
+  case " ${attempted_issues[*]-} " in
+    *" $N "*) ;;
+    *) attempted_issues+=("$N") ;;
+  esac
 done
 
 say "run finished: $done_count issue(s) landed, $(wc -l < "$SKIPPED" | tr -d ' ') abandoned"
+[ "$retried" -gt 0 ] && say "re-attempted $retried abandoned issue(s) on the batch's final tree: $retry_landed landed, $((retried - retry_landed)) still need a human"
 say "total spend: \$$(jq -s '[.[].total_cost_usd // 0] | add' "$LOGS"/*.json 2>/dev/null)"
 
 # The retrospective on the batch — the loop reviewing itself rather than the code. Off by default:

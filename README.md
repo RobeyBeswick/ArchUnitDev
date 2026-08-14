@@ -25,6 +25,9 @@ for the lowest-numbered open issue:
                       └────────── fixer ◀──────────┘   × MAX_ROUNDS, then judge
                                                        │ once more and stop
                                     park on abandoned/issue-N, label needs-human, move on
+                                                       │
+                                    and once the queue is done, one more attempt at it
+                                    on the tree the batch finished with
 
 once the batch is done, if RETRO=1:
 
@@ -138,6 +141,27 @@ weakening the checks.
 the work is committed to `abandoned/issue-N`, pushed, and the target repo is reset to the base commit
 so the next issue starts from a clean tree. The commit message carries the reason and the verdicts its
 tip was judged on, because that branch is the handoff to whoever picks the issue up.
+
+**And the issue gets one more attempt before the run ends.** The backlog is numbered in dependency
+order, so an abandonment leaves a hole in the middle of an ordered queue while everything after it
+keeps landing on top: #21 was an unimplemented Files API terminal, #22–#26 landed over it, and the
+batch finished with five commits of kernel sitting above a gap that the abandoned issue had been the
+prerequisite for. So when the queue is done, every issue *this run* abandoned is re-attempted once
+against the tree the batch actually reached — a fresh implementer on a bigger base, not a fourth fix
+round on a diff that had stopped converging.
+
+Three things keep that from being a licence to spend twice. Only issues this run abandoned: an entry
+already in `skipped` is one a human parked, and re-attempting it is that human's call. Only when the
+base moved: if nothing landed after the issue, the re-attempt would run the same prompts over the same
+tree and fail the same way, so it is skipped — which means the pathological batch where *everything*
+abandons retries nothing and costs nothing. And once: a re-attempt that fails again parks on
+`abandoned/issue-N-attempt-2`, beside the first attempt rather than on top of it, and stops there.
+
+The retry is exempt from `MAX_ISSUES`, because a re-attempt of #21 is still #21 and adds nothing to the
+set of issues the run was scoped to. Bounding the run instead of the main pass would make the retry
+unreachable in every batch that fills its bound — that is, every batch that goes well. It does not run
+after `MAX_CONSECUTIVE_ABANDONS` trips, because a broken environment is the one case where spending
+again is certainly wrong. Set `RETRY_ABANDONED=` to switch it off.
 
 ## Auth
 
@@ -256,7 +280,9 @@ REPO=/Users/rbz/Projects/ArchUnitGo LOGS=./logs MAX_ISSUES=1 MODEL=opus ./run.sh
 
 Two of the files in `logs/` are state rather than output, and they are the only state the harness
 keeps outside git and the issues themselves. `skipped` lists the issues abandoned after
-`MAX_ROUNDS`; `landed` lists the issues that were implemented but deliberately left open, which
+`MAX_ROUNDS` — an issue is taken back off it if a re-attempt lands, because it no longer needs a human
+and both the queue and the retrospective read that file as the answer to whether it does;
+`landed` lists the issues that were implemented but deliberately left open, which
 only happens under `NO_PUSH`. Both are excluded from the queue. Delete them to make the loop
 reconsider an issue — and delete `landed` if you throw away the local commits it refers to,
 or the queue will skip work that is no longer there.
@@ -312,6 +338,7 @@ All environment variables, all with defaults that work:
 | `MAX_ROUNDS` | `3` | *Fix* rounds before an issue is abandoned. The loop runs one more judged round than this, so its last act on an issue is always a gate plus a verdict, never a fix nobody looked at. `MAX_ROUNDS=3` means at most 3 fixes and up to 4 rounds of critics. |
 | `MAX_ISSUES` | `0` | Issues to *attempt*, abandonments included — a bound on what the run touches and what it spends, not on how much of it lands. `0` = run until the queue is empty. Set to `1` for a smoke test. |
 | `MAX_CONSECUTIVE_ABANDONS` | `2` | Stop the run after this many issues are abandoned back to back, on the reasoning that a run of abandons is far more often a broken environment than several independently hard issues. `0` = never stop. |
+| `RETRY_ABANDONED` | `1` | Re-attempt each issue this run abandoned, once, after the queue is done — but only if something landed after it, so the re-attempt gets a base the first attempt did not have. Exempt from `MAX_ISSUES`; skipped entirely if the abandon breaker tripped. Empty = off. |
 | `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. |
 | `NO_PUSH` | unset | Commit locally, but do not push and do not close the issue. Use it for the first run. The issue is recorded in `logs/landed` so the queue still advances. |
 | `TIMEOUT` | `30m` | Wall clock per invocation. |
@@ -360,7 +387,8 @@ machinery. The scenarios are:
 | `breaker` | Consecutive abandonments stop the run before the rest of the queue is spent on a broken environment — and `MAX_CONSECUTIVE_ABANDONS=0` runs it out anyway. |
 | `preflight` | A Go repo with no `.golangci.yml`, and a missing linter binary, are both fatal — and `ALLOW_NO_LINT=1` overrides both. |
 | `moduleproxy` | An unresolvable module proxy warns and carries on rather than killing the run, names `GOPROXY=direct` as the fix, and the probe stays read-only. |
-| `bounded` | `MAX_ISSUES` counts attempts, not landings: a queue whose first issue abandons stops at the bound instead of reaching for another issue to make the numbers up, and a landing counts the same as an abandonment. |
+| `bounded` | `MAX_ISSUES` counts attempts, not landings: a queue whose first issue abandons stops at the bound instead of reaching for another issue to make the numbers up, and a landing counts the same as an abandonment. Also that the retry phase runs despite a full bound while still not admitting an issue outside it. |
+| `retry` | An issue that cannot pass until the issue *after* it has landed — the dependency-ordered queue with a hole in it. It abandons, the next one lands over it, and the re-attempt on the batch's final tree passes: a fresh implementer with none of the first attempt's findings, both attempts' artifacts and parked branches intact side by side, and the skip list unwound because the issue no longer needs a human. `abandon` covers the other half, that an unchanged base is not re-attempted at all. |
 | `retro_pack` | The evidence pack is arithmetic over hand-written artifacts: issues sorted numerically rather than lexically (`2` before `11`), landed-but-open told apart from abandoned, per-round gate outcomes and per-critic verdicts, cost summed per issue, and rounds that never ran not invented. |
 | `retro` | `RETRO=1` reviews the batch that just landed and not an earlier batch's artifacts in the same log directory, writes its report to `logs/` and to stdout, and cannot fail the run. Also the one place the suite asserts that `GH_TOKEN` reaches no model invocation at all — the harness's only enforced boundary. |
 | `dirty` | Uncommitted changes in the target repo are fatal before any model is invoked, the files are named, and `ALLOW_DIRTY=1` runs anyway and commits them as warned. |
