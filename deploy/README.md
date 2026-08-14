@@ -47,7 +47,30 @@ aws ec2 modify-instance-metadata-options \
 
 Running the container with `--network host` avoids it instead.
 
-## 3. Check before committing to a night
+## 3. Put the target repo and the log directory on the instance
+
+Neither is in the image — both are bind-mounted, so they have to exist on the host first.
+
+```bash
+sudo dnf install -y docker git            # Amazon Linux 2023
+sudo systemctl enable --now docker
+sudo usermod -aG docker ec2-user          # log out and back in for this to take effect
+
+git clone https://github.com/LukasNiessen/ArchUnitGo.git /home/ec2-user/ArchUnitGo
+mkdir -p /home/ec2-user/logs
+```
+
+Two details that bite:
+
+**Ownership.** The image runs as `dev`, UID 1000, and a bind mount carries the host's ownership
+straight through — so both directories must be owned by UID 1000 or the loop cannot write. On Amazon
+Linux `ec2-user` *is* 1000, so a clone made as `ec2-user` lines up. If you build with a different
+`--build-arg UID`, match it.
+
+**The checked-out branch is the branch the loop works on.** `run.sh` commits to whatever is checked
+out and pushes `HEAD`; it never switches branches. A fresh clone is on `main`, which is what you want.
+
+## 4. Check before committing to a night
 
 ```bash
 docker run --rm -e GH_TOKEN -e PREFLIGHT_ONLY=1 \
@@ -59,21 +82,69 @@ Costs nothing. You want `auth: Bedrock in us-east-1 as arn:aws:sts::…:assumed-
 and **no** static-credentials warning. Seeing `assumed-role/ArchUnitDevLoop` is the proof that the
 instance profile — not a leftover environment variable — is what answered.
 
-## 4. Run it
+## 5. Run it
 
 ```bash
 nohup docker run --rm \
   -e GH_TOKEN \
   -v /home/ec2-user/ArchUnitGo:/work/repo \
   -v /home/ec2-user/logs:/work/logs \
-  archunitdev > loop.out 2>&1 &
+  archunitdev > /home/ec2-user/logs/loop.out 2>&1 &
 
 tail -f /home/ec2-user/logs/run.log
 ```
 
+`loop.out` goes *inside* the log directory on purpose: it catches anything that dies before `run.sh`
+opens `run.log`, and putting it there means the log sync below picks it up with everything else.
+
 `GH_TOKEN` is the only secret to pass, and it is deliberately **not** baked into the image. Note that
 it is stripped from the environment of every model invocation — only the harness itself holds it, which
 is what stops an implementer from pushing or closing an issue on its own.
+
+## 6. Keep the logs
+
+The logs live on the instance's root EBS volume, which is deleted when the instance is terminated. That
+is the only copy of *why* anything happened: GitHub keeps the outcome — the commits, the closed issues —
+while the diff each critic judged, the verdict it returned and the gate output that preceded it are all
+in `logs/`. Roughly 400KB per issue, so the whole 44-issue backlog is about 15MB. Storing that is free;
+losing it is not recoverable.
+
+`deploy/log-sync.sh` copies it to S3 on a timer, host-side, alongside the container:
+
+```bash
+aws s3 mb s3://archunitdev-logs --region us-east-1        # once; keep it private
+
+# edit deploy/s3-logs-policy.json to name the bucket, then:
+aws iam put-role-policy --role-name ArchUnitDevLoop \
+  --policy-name WriteLoopLogs --policy-document file://deploy/s3-logs-policy.json
+
+nohup env S3_LOGS=s3://archunitdev-logs/loop LOGS=/home/ec2-user/logs \
+  /harness/deploy/log-sync.sh > /home/ec2-user/log-sync.out 2>&1 &
+```
+
+**On a timer, not at the end**, because the failure being insured against is the instance dying
+mid-run — an end-of-run copy is exactly the case that never executes. `SYNC_EVERY` defaults to 300s.
+The first sync is fatal if it fails, so a bucket typo or a missing role policy surfaces at the start of
+the night rather than at 04:00; after that a failure is a warning and it keeps trying. `SIGTERM` makes
+it flush before exiting, so stopping the run loses nothing.
+
+Each run goes under its own `RUN_ID` prefix (a UTC timestamp) so that re-running an issue cannot
+silently overwrite the artifacts explaining what happened the first time. Set `RUN_ID` yourself to
+resume into an existing prefix after a restart. The alternative — a flat prefix with bucket versioning
+switched on — is equally good and needs no prefix bookkeeping.
+
+The role policy is deliberately write-only: `PutObject` and a prefix-scoped `ListBucket`, which is all
+`aws s3 sync` needs to upload. Pulling the logs back down is something you do from your own machine
+with your own credentials:
+
+```bash
+aws s3 sync s3://archunitdev-logs/loop/20260814T220000Z ./logs-from-ec2
+```
+
+Note that `logs/skipped` and `logs/landed` are *state*, not output — the loop reads them to keep the
+queue moving. They are synced with everything else, which is what makes a restore onto a fresh instance
+pick up where the dead one left off. Be careful restoring `landed` next to a repo whose local commits
+you did not also restore: the queue would skip work that no longer exists.
 
 ## Egress
 
