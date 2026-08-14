@@ -45,6 +45,7 @@ MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-400000}"
 NO_PUSH="${NO_PUSH:-}"              # set to 1 to commit locally but not push or close issues
 MAX_CONSECUTIVE_ABANDONS="${MAX_CONSECUTIVE_ABANDONS:-2}"   # stop the run after this many in a row; 0 = never stop
 RETRY_ABANDONED="${RETRY_ABANDONED:-1}"   # re-attempt abandoned issues once the batch has grown under them; empty = off
+MAX_SPEND="${MAX_SPEND:-0}"         # dollars this run may spend before it stops at an issue boundary; 0 = no cap
 
 SCHEMA="$(cat "$HARNESS/schema/verdict.json")"
 SKIPPED="$LOGS/skipped"          # abandoned: got no further after MAX_ROUNDS, needs a human
@@ -67,6 +68,27 @@ forget_skipped() {
   awk -v n="$1" '$0 != n' "$SKIPPED" > "$SKIPPED.tmp" && mv "$SKIPPED.tmp" "$SKIPPED"
 }
 
+# What this run has cost so far, in dollars, from the only authority on it: the total_cost_usd every
+# invocation writes into its own result JSON.
+#
+# Two things make this a file scan rather than a variable. LOGS is long-lived and accumulates every
+# batch ever run into it, so a glob over all of it answers a different question ("what has this log
+# directory cost?") than the one a cap is about — hence RUN_MARKER, touched at startup, and -newer.
+# And there is nowhere for an accumulator to live: work() runs inside a pipeline subshell and the
+# critics run with `&`, so anything either of them adds to a shell variable is discarded when it
+# exits. The files are the shared state; nothing else is.
+RUN_MARKER="$LOGS/.run-started"
+spend_this_run() {
+  # -exec + batches, and jq prints one number per file, so awk sums across every batch. Piping the
+  # list into xargs instead would split into several jq invocations and several separate sums.
+  find "$LOGS" -maxdepth 1 -name '*.json' -newer "$RUN_MARKER" -exec jq -r '.total_cost_usd // 0' {} + 2>/dev/null \
+    | awk '{ t += $1 } END { printf "%.2f", t + 0 }'
+}
+spend_all_time() {
+  jq -s '[.[].total_cost_usd // 0] | add // 0' "$LOGS"/*.json 2>/dev/null \
+    | awk '{ printf "%.2f", $1 + 0 }'
+}
+
 # --- preflight -------------------------------------------------------------------
 # Every check here is something that otherwise fails silently or halfway through the night.
 
@@ -75,6 +97,12 @@ command -v claude >/dev/null || die "claude not on PATH"
 command -v gh     >/dev/null || die "gh not on PATH"
 command -v jq     >/dev/null || die "jq not on PATH"
 command -v go     >/dev/null || say "WARNING: go not on PATH — the build and test gate will be skipped"
+
+# A cap that does not parse as a number is worse than no cap: awk would compare it as a string and
+# either never fire or fire before the first issue, and either way the operator believes they set one.
+case "$MAX_SPEND" in
+  ''|*[!0-9.]*|*.*.*) die "MAX_SPEND=$MAX_SPEND is not a dollar amount (a number like 400 or 12.50, or 0 for no cap)" ;;
+esac
 
 # `timeout` is coreutils: it is in the image, but not on a stock macOS box, where it is `gtimeout`
 # or absent entirely. Resolve it once here — otherwise every invocation dies on "command not found"
@@ -200,7 +228,7 @@ if [ -s "$LANDED" ]; then
 fi
 
 say "harness $HARNESS -> repo $REPO ($(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD))"
-say "model $MODEL (fallback $FALLBACK_MODEL), $MAX_ROUNDS rounds/issue, $TIMEOUT per invocation, no spend cap"
+say "model $MODEL (fallback $FALLBACK_MODEL), $MAX_ROUNDS rounds/issue, $TIMEOUT per invocation, $([ "$MAX_SPEND" = 0 ] && echo "no spend cap" || echo "\$$MAX_SPEND spend cap")"
 say "queue: $(gh issue list --state open --limit 300 --json number --jq 'length') open issue(s)"
 
 # PREFLIGHT_ONLY=1 verifies the wiring — auth, tools, repo, remote, queue — and spends nothing.
@@ -281,6 +309,10 @@ findings_text() {
 
 # --- the loop --------------------------------------------------------------------
 
+# The line everything this run spends is measured against. Touched here rather than at the top of the
+# script so PREFLIGHT_ONLY, which spends nothing, does not disturb the marker a real run left behind.
+touch "$RUN_MARKER"
+
 done_count=0
 attempted=0
 # The issues *this* run touched, which is not the same as the issues the log directory holds
@@ -314,6 +346,21 @@ while :; do
   if [ "$phase" = main ] && [ "$MAX_ISSUES" -gt 0 ] && [ "$attempted" -ge "$MAX_ISSUES" ]; then
     say "hit MAX_ISSUES=$MAX_ISSUES"
     phase=retry
+  fi
+
+  # The spend cap. Checked here, between issues, and deliberately nowhere else: an issue killed
+  # part-way through has an unjudged diff in the working tree and no branch to its name, which is the
+  # one outcome the loop is built to never produce. So the cap is a bound on what the run *starts*,
+  # not on what it finishes — overshoot by up to one issue is the price of never abandoning work
+  # mid-flight, and an issue costs at most an implement, MAX_ROUNDS fixes and their critics.
+  #
+  # It applies in the retry phase too. A re-attempt is money like any other.
+  if [ "$attempted" -gt 0 ] && [ "$MAX_SPEND" != 0 ]; then
+    spent="$(spend_this_run)"
+    if awk -v s="$spent" -v m="$MAX_SPEND" 'BEGIN { exit !(s >= m) }'; then
+      say "hit MAX_SPEND=\$$MAX_SPEND (\$$spent spent over $attempted issue(s)) — stopping here rather than starting another issue"
+      break
+    fi
   fi
 
   # Two circuit breakers, both aimed at the same failure: the environment breaks partway through a
@@ -611,6 +658,10 @@ while :; do
     fi
   fi
   attempted=$((attempted + 1))
+  # Narrated at every issue boundary whether or not there is a cap, because this is the number you
+  # want when you come back to a night's log and the question is "what did that cost me": the
+  # end-of-run total tells you afterwards, and this tells you while it is still running.
+  say "spend so far this run: \$$(spend_this_run) over $attempted issue(s)"
   # Once per issue, not once per attempt: this list is what the retrospective is given as the batch,
   # and a duplicate number would have it write the same issue up twice.
   case " ${attempted_issues[*]-} " in
@@ -621,7 +672,10 @@ done
 
 say "run finished: $done_count issue(s) landed, $(wc -l < "$SKIPPED" | tr -d ' ') abandoned"
 [ "$retried" -gt 0 ] && say "re-attempted $retried abandoned issue(s) on the batch's final tree: $retry_landed landed, $((retried - retry_landed)) still need a human"
-say "total spend: \$$(jq -s '[.[].total_cost_usd // 0] | add' "$LOGS"/*.json 2>/dev/null)"
+# This run's spend, and the log directory's, separately. They differ whenever LOGS has been used
+# before, which is the normal case here — and the single glob total used to be reported as "total
+# spend", which read as this batch's cost and quietly grew by every earlier batch.
+say "spend: \$$(spend_this_run) this run; \$$(spend_all_time) in $(basename "$LOGS") all told"
 
 # The retrospective on the batch — the loop reviewing itself rather than the code. Off by default:
 # it costs a model invocation and it is only worth anything once several issues have been through.
