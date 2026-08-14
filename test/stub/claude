@@ -81,7 +81,7 @@ case "$tag" in
 
   *-review-*)
     case "$SCENARIO" in
-      happy|testcritic) verdict_pass ;;
+      happy|testcritic|union) verdict_pass ;;
       fixround)
         if grep -q FIXROUND-ACK NOTES.md 2>/dev/null
           then verdict_pass
@@ -135,6 +135,16 @@ case "$tag" in
 
   *-tests-*)
     case "$SCENARIO" in
+      # Two concurrent passes of the same critic, each seeing something the other does not — the
+      # measured failure DOUBLE_CRITICS exists for. Which pass this is comes from the tag, which is
+      # also the only thing that differs between the two invocations.
+      union)
+        if grep -q FIXROUND-ACK NOTES.md 2>/dev/null; then verdict_pass
+        elif [ "${tag%b}" != "$tag" ]; then
+          verdict_fail "sweep_test.go" "The second thing, which only an exhaustive pass finds." "Assert on it."
+        else
+          verdict_fail "feature_test.go" "The most important thing." "Assert on it."
+        fi ;;
       # The test critic objects while the other two pass. That is what proves run.sh sends the fixer
       # one findings section rather than an empty heading for every critic that had nothing to say.
       testcritic)

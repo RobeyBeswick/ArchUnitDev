@@ -170,6 +170,68 @@ else
   printf 'BASE not set or not a valid revision — skipping\n'
 fi
 
+# Every `const Kind... = "literal"` has its *string value* asserted somewhere in the tests.
+#
+# The failure this catches has no other net. Every test in the tree compares `Kind()` against the
+# constant, which is a tautology: respell the constant and the whole suite stays green — including
+# respelling it onto a collision with a sibling kind, which the code says must not happen. The test
+# critic found exactly this on issue #21 and it cost a full round ($5.05 of critics and fixer) to
+# report and fix something a grep decides.
+#
+# Base-relative, like the test count above, and for the same reason: `KindFileDependency` landed
+# unpinned in #20 with all three critics passing it, and a gate that failed on the tree's existing
+# holes would blame the next issue's implementer for them and burn its rounds on somebody else's
+# work. What is forbidden is *adding* one.
+step "every violation-kind string value is pinned by a literal in a test"
+# <rev|""> -> "NAME LITERAL" per line, from the non-test sources.
+kind_consts() {
+  if [ -n "$1" ]; then
+    git grep -nE 'const Kind[A-Za-z0-9_]+ [A-Za-z0-9_.]+ = "[a-z0-9-]+"' "$1" -- '*.go' 2>/dev/null
+  else
+    grep -rnE 'const Kind[A-Za-z0-9_]+ [A-Za-z0-9_.]+ = "[a-z0-9-]+"' . --include='*.go' 2>/dev/null
+  fi | grep -v '_test\.go' \
+     | sed -E 's/.*const (Kind[A-Za-z0-9_]+) [A-Za-z0-9_.]+ = "([a-z0-9-]+)".*/\1 \2/' \
+     | sort -u
+}
+# <literal> <rev|""> -> 0 if some test file contains it as a quoted string.
+kind_pinned() {
+  if [ -n "$2" ]; then git grep -qF "\"$1\"" "$2" -- '*_test.go' 2>/dev/null
+  else grep -rqF "\"$1\"" . --include='*_test.go' 2>/dev/null; fi
+}
+# A here-doc rather than a pipe into `while`: a pipeline's loop body runs in a subshell, so
+# everything it accumulated is discarded at the `done`.
+unpinned_now=""
+while read -r kname klit; do
+  [ -n "$kname" ] || continue
+  kind_pinned "$klit" "" || unpinned_now="$unpinned_now $kname"
+done <<EOF
+$(kind_consts "")
+EOF
+if [ -n "${BASE:-}" ] && git rev-parse --verify --quiet "$BASE" >/dev/null 2>&1; then
+  unpinned_base=""
+  while read -r kname klit; do
+    [ -n "$kname" ] || continue
+    kind_pinned "$klit" "$BASE" || unpinned_base="$unpinned_base $kname"
+  done <<EOF
+$(kind_consts "$BASE")
+EOF
+  added=""
+  for kname in $unpinned_now; do
+    case " $unpinned_base " in *" $kname "*) ;; *) added="$added $kname" ;; esac
+  done
+  if [ -n "$added" ]; then
+    printf 'VIOLATION: the string value of%s is asserted nowhere in the tests.\n' "$added"
+    printf 'Every test compares Kind() against the constant, which passes whatever the constant says —\n'
+    printf 'so respelling it, including onto a collision with another kind, leaves the suite green.\n'
+    printf 'Assert the literal in a test, as the sibling kinds already do.\n'
+    fail=1
+  elif [ -n "$unpinned_now" ]; then
+    printf 'unpinned at the base commit too, so not this issue to fix:%s\n' "$unpinned_now"
+  fi
+else
+  printf 'BASE not set or not a valid revision — reporting only:%s\n' "${unpinned_now:- none unpinned}"
+fi
+
 step "at least one test exists"
 if [ -f go.mod ] && ! find . -name '*_test.go' -not -path './.git/*' | grep -q .; then
   printf 'VIOLATION: the module has no test files at all.\n'
