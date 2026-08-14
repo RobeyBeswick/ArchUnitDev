@@ -20,7 +20,7 @@ for the lowest-numbered open issue:
                       │                   │
                       ├─ reviewer ────┐   │
                       ├─ idiom critic │   │
-                      │  test critic  ┴───┴──▶ all PASS? ───▶ commit, push, close issue
+                      │  test critic ×2───┴──▶ all PASS? ───▶ commit, push, close issue
                       │                            │ no
                       └────────── fixer ◀──────────┘   × MAX_ROUNDS, then judge
                                                        │ once more and stop
@@ -34,6 +34,8 @@ once the batch is done, if RETRO=1:
     retro.sh ──▶ reads every artifact the batch left ──▶ a report proposing changes to the harness
                  (read-only: it judges the prompts, it does not edit them)
 ```
+
+`×2`: the roles in `DOUBLE_CRITICS` run twice in round 1, differently prompted, findings unioned.
 
 **There is no state store.** The queue is "the lowest-numbered open issue", progress is the git history,
 and the audit trail is the closed issues plus `NOTES.md` in the target repo. A killed run is resumed by
@@ -122,6 +124,24 @@ test. Two findings about one test, one round apart, on an issue that then landed
 had. All three prompts now say to report everything blocking in one pass, because a held-back finding
 is a round the issue may not have.
 
+**And because telling it to is not the same as it doing it, round 1 runs that critic twice.** The
+instruction above is what a prompt can do about a held-back finding; it did not stop #26 from spending a
+round on the same shape of thing. So the roles named in `DOUBLE_CRITICS` (the test critic, by default)
+get two concurrent invocations in round 1, and the loop unions their findings into the one verdict the
+rest of the round reads. The two are not copies: the second is told that another instance is already
+reporting whatever it considers most important, and that its own job is the opposite one — walk the
+changed files and name *every* instance rather than the worst, because a finding held back for being
+smaller than another one is a finding nobody makes.
+
+Two identical passes would be the weakest way to spend that money; the value is in the different
+framing, not the redundancy. It is round 1 only, because a round-1 finding costs a fix round and a
+round-3 finding costs a fix round *and* the two rounds already spent — the marginal round is where
+completeness is worth paying for. And the union lands at the canonical `$TAG-$role-$round.verdict.json`,
+FAIL if either pass failed, so the unanimity check, the fixer's prompt and `retro.sh`'s round table are
+all unchanged: each pass's own verdict stays on disk beside it as evidence, and nothing downstream has
+to know a role can be plural. At about a dollar a pass, concurrent, it costs no wall-clock and less than
+a fifth of the round it is trying to avoid.
+
 Its prompt is built on one mechanism — **name the mutation**. For every test, state the one-line change
 to the implementation that makes it fail; if you cannot, the test asserts nothing and that is a block.
 It is explicitly forbidden from reporting coverage percentages (there is no threshold in the gate) or
@@ -136,6 +156,19 @@ thing coverage cannot tell you, because a deleted test takes its uncovered lines
 with `check-blank` covers `_ =`, and `go vet`/`SA4011` cover `if false`. Both critics are told to treat a
 weakened check as always blocking, and the fixer is told that weakening `.golangci.yml` counts as
 weakening the checks.
+
+**A test that cannot fail is the same defect wearing a passing suite.** The gate now also requires that
+every `const Kind... = "literal"` has its *string value* asserted by a literal somewhere in the tests.
+Every test in the tree compares `Kind()` against the constant, which is a tautology: respell the
+constant and the suite stays green, including respelling it onto a collision with a sibling kind, which
+the data model says cannot happen. The test critic found precisely this on #21, and it cost a full round
+— $5.05 of critics and fixer — to report and fix something a `grep` decides for nothing.
+
+It is base-relative, like the test count, and for the same reason: `KindFileDependency` landed unpinned
+in #20 with all three critics passing it, so a check that failed on the tree's existing holes would
+hand the next issue's implementer somebody else's work and burn its rounds on it. What is forbidden is
+*adding* one; what is already unpinned is reported as pre-existing and passes. Verified against the real
+history before it shipped — it fails on the commit that introduced the hole and passes on the one before.
 
 **Nothing is lost when an issue defeats the loop.** After `MAX_ROUNDS` fixes and a final judged round,
 the work is committed to `abandoned/issue-N`, pushed, and the target repo is reset to the base commit
@@ -156,6 +189,14 @@ base moved: if nothing landed after the issue, the re-attempt would run the same
 tree and fail the same way, so it is skipped — which means the pathological batch where *everything*
 abandons retries nothing and costs nothing. And once: a re-attempt that fails again parks on
 `abandoned/issue-N-attempt-2`, beside the first attempt rather than on top of it, and stops there.
+
+The re-attempt is not, however, told nothing. It gets the findings that were still outstanding when the
+first attempt was abandoned — the last round that produced any, from every critic that produced them —
+under a heading that is explicit about what they are: a previous attempt was parked on
+`abandoned/issue-N`, it is not in this tree, you are not resuming it, and you are free to solve the
+issue a different way. What you are not free to do is reproduce these. Without that, the second
+implementer starts from the issue text alone and the loop's best evidence about where this particular
+issue is hard — three rounds of it — is on a branch nobody reads.
 
 The retry is exempt from `MAX_ISSUES`, because a re-attempt of #21 is still #21 and adds nothing to the
 set of issues the run was scoped to. Bounding the run instead of the main pass would make the retry
@@ -356,6 +397,7 @@ All environment variables, all with defaults that work:
 | `MAX_ISSUES` | `0` | Issues to *attempt*, abandonments included — a bound on what the run touches and what it spends, not on how much of it lands. `0` = run until the queue is empty. Set to `1` for a smoke test. |
 | `MAX_CONSECUTIVE_ABANDONS` | `2` | Stop the run after this many issues are abandoned back to back, on the reasoning that a run of abandons is far more often a broken environment than several independently hard issues. `0` = never stop. |
 | `RETRY_ABANDONED` | `1` | Re-attempt each issue this run abandoned, once, after the queue is done — but only if something landed after it, so the re-attempt gets a base the first attempt did not have. Exempt from `MAX_ISSUES`; skipped entirely if the abandon breaker tripped. Empty = off. |
+| `DOUBLE_CRITICS` | `tests` | Roles that run **twice** in round 1, concurrently, with their findings unioned — the second pass told to sweep exhaustively rather than to report what matters most. Aimed at one measured failure: the test critic reporting one of two findings that were both in front of it, at a cost of a full round each time. Empty = every role runs once. |
 | `MAX_SPEND` | `0` | Dollars *this run* may spend before it stops. Checked at issue boundaries only, so the run overshoots by at most one issue rather than ever interrupting one; measured from each invocation's `total_cost_usd`, counting only this run's artifacts. `0` = no cap. |
 | `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. |
 | `NO_PUSH` | unset | Commit locally, but do not push and do not close the issue. Use it for the first run. The issue is recorded in `logs/landed` so the queue still advances. |
@@ -406,6 +448,8 @@ machinery. The scenarios are:
 | `preflight` | A Go repo with no `.golangci.yml`, and a missing linter binary, are both fatal — and `ALLOW_NO_LINT=1` overrides both. |
 | `moduleproxy` | An unresolvable module proxy warns and carries on rather than killing the run, names `GOPROXY=direct` as the fix, and the probe stays read-only. |
 | `bounded` | `MAX_ISSUES` counts attempts, not landings: a queue whose first issue abandons stops at the bound instead of reaching for another issue to make the numbers up, and a landing counts the same as an abandonment. Also that the retry phase runs despite a full bound while still not admitting an issue outside it. |
+| `double_critic` | A role in `DOUBLE_CRITICS` runs twice in round 1 and only round 1, the two passes get different prompts, both findings reach the fixer in the same round, the canonical verdict path holds the union while each pass's own verdict survives as evidence — and `DOUBLE_CRITICS=` switches it off. |
+| `kind_pinning` | The gate's kind-pinning guard: adding a `ViolationKind` whose string value no test asserts fails the gate and names the constant; one that was already unpinned at the base commit does not, because it is not this issue's to fix; and a test comparing `Kind()` to the constant does not count as pinning it, that being the tautology the whole check is about. |
 | `spend` | `MAX_SPEND` stops the run at the first issue boundary past the cap, having finished the issue that crossed it rather than interrupting it, and never starts the next one. Also that the cap is per run and not per log directory — a second run into a directory already over the cap still works — that the final line separates this run's spend from the directory's, and that a cap which does not parse as a number is fatal in preflight rather than silently no-op. |
 | `retry` | An issue that cannot pass until the issue *after* it has landed — the dependency-ordered queue with a hole in it. It abandons, the next one lands over it, and the re-attempt on the batch's final tree passes: a fresh implementer with none of the first attempt's findings, both attempts' artifacts and parked branches intact side by side, and the skip list unwound because the issue no longer needs a human. `abandon` covers the other half, that an unchanged base is not re-attempted at all. |
 | `retro_pack` | The evidence pack is arithmetic over hand-written artifacts: issues sorted numerically rather than lexically (`2` before `11`), landed-but-open told apart from abandoned, per-round gate outcomes and per-critic verdicts, cost summed per issue, and rounds that never ran not invented. |

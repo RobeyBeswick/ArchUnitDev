@@ -44,8 +44,9 @@ FALLBACK_MODEL="${FALLBACK_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-400000}"
 NO_PUSH="${NO_PUSH:-}"              # set to 1 to commit locally but not push or close issues
 MAX_CONSECUTIVE_ABANDONS="${MAX_CONSECUTIVE_ABANDONS:-2}"   # stop the run after this many in a row; 0 = never stop
-RETRY_ABANDONED="${RETRY_ABANDONED:-1}"   # re-attempt abandoned issues once the batch has grown under them; empty = off
+RETRY_ABANDONED="${RETRY_ABANDONED-1}"    # re-attempt abandoned issues once the batch has grown under them; empty = off
 MAX_SPEND="${MAX_SPEND:-0}"         # dollars this run may spend before it stops at an issue boundary; 0 = no cap
+DOUBLE_CRITICS="${DOUBLE_CRITICS-tests}"  # roles that run twice in round 1, findings unioned; empty = none
 
 SCHEMA="$(cat "$HARNESS/schema/verdict.json")"
 SKIPPED="$LOGS/skipped"          # abandoned: got no further after MAX_ROUNDS, needs a human
@@ -466,13 +467,48 @@ while :; do
   fi
   [ "$body_bytes" -gt 80 ] || say "  WARNING: issue #$N has almost no description — the implementer is working from the title alone"
 
-  # A fresh implementer, told nothing about the attempt that was abandoned. Feeding it the first
-  # attempt's diff and findings would make this a fourth fix round rather than a second attempt, and
-  # the round it would resume is the one that had already stopped converging. What has actually changed
-  # is the tree underneath it, which it reads for itself.
+  # A fresh implementer working from the issue and the tree, with one thing carried across from an
+  # attempt that was abandoned: the findings that were still outstanding when it was parked.
+  #
+  # Not its diff, and not its NOTES.md. Those would make this a fourth fix round rather than a second
+  # attempt, resuming the round that had already stopped converging — and starting clean is what
+  # produced a diff that passed in two rounds when #21 and #26 were re-attempted. The findings are
+  # different: they are the paid-for account of *why* the first attempt failed, they were sitting
+  # unread on disk while $40 went on re-deriving the same work, and as constraints rather than a
+  # worklist they cost nothing to honour.
+  carry="$LOGS/$TAG-carryover.md"
+  rm -f "$carry"
+  if [ "$attempt" -gt 1 ]; then
+    # The last round that found anything, counting down: the final round of an abandoned issue is
+    # sometimes a gate failure with no verdicts at all, and the round before it is then the one
+    # holding the reasons.
+    for r in $(seq "$((MAX_ROUNDS + 1))" -1 1); do
+      for role in "${CRITICS[@]}"; do
+        v="$LOGS/$N-$role-$r.verdict.json"
+        [ -f "$v" ] || continue
+        [ "$(jq -r '.findings | length' "$v" 2>/dev/null)" -gt 0 ] 2>/dev/null || continue
+        if [ ! -s "$carry" ]; then
+          {
+            echo "## Outstanding findings from an earlier attempt at this issue"
+            echo
+            echo "A previous attempt was reviewed, could not be got past review, and is parked on the"
+            echo "branch \`abandoned/issue-$N\`. It is **not** in the tree you are working on, and you are"
+            echo "not resuming it: implement the issue as you see it now, against a tree that has moved."
+            echo "These are the findings that were still outstanding when it was abandoned. You are free"
+            echo "to solve the issue a different way; you are not free to reproduce these."
+            echo
+          } > "$carry"
+        fi
+        { echo "From the $(critic_name "$role"), round $r:"; findings_text "$v"; echo; } >> "$carry"
+      done
+      [ -s "$carry" ] && break
+    done
+    [ -s "$carry" ] && say "  carrying $(grep -c '^- ' "$carry" | tr -d ' ') outstanding finding(s) from the abandoned attempt into the re-implementation"
+  fi
   { cat "$HARNESS/prompts/implement.md"
     echo "## Issue #$N: $TITLE"; echo
     cat "$LOGS/issue-$N.md"
+    [ -s "$carry" ] && { echo; cat "$carry"; }
   } | work "$TAG-implement"
 
   approved=0
@@ -527,15 +563,59 @@ while :; do
     fi
 
     # 3. Every critic, concurrently, on the same diff.
+    #
+    # A role named in DOUBLE_CRITICS runs *twice* in round 1 and its findings are unioned. This is
+    # aimed at one measured failure, not at thoroughness in general: three times now the test critic
+    # has reported one of two findings that were both in front of it, and the second one has cost a
+    # whole round each time — on #26 the round-2 finding was in a test file that is byte-identical in
+    # the round-1 and round-2 diffs, so it was fully visible in round 1. Two rounds of prose in
+    # tests.md have not fixed it, which is what makes it a structural problem rather than a wording one.
+    #
+    # Round 1 only, because that is where a missed finding costs a round; and the two passes are given
+    # different framings rather than being identical, because two identical prompts are the weakest
+    # available way to spend twice — the second pass is told to sweep exhaustively and report every
+    # instance, which is precisely the lens the misses have been in.
     for role in "${CRITICS[@]}"; do
-      { cat "$HARNESS/prompts/$role.md"
-        echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo
-        echo "## What the implementer says it did"; echo; cat "$LOGS/$TAG-implement.txt"; echo
-        echo "## The diff under review (since $BASE)"; echo '```diff'
-        head -c "$MAX_DIFF_BYTES" "$LOGS/$TAG-diff-$round.patch"; echo '```'
-      } | critic "$TAG-$role-$round" "$LOGS/$TAG-$role-$round.verdict.json" &
+      ctags="$TAG-$role-$round"
+      case " $DOUBLE_CRITICS " in
+        *" $role "*) [ "$round" -eq 1 ] && ctags="$TAG-$role-${round}a $TAG-$role-${round}b" ;;
+      esac
+      for ctag in $ctags; do
+        { cat "$HARNESS/prompts/$role.md"
+          case "$ctag" in
+            *b) cat <<'SWEEP'
+
+## For this pass specifically
+
+Another instance of this review is running on this same diff, concurrently, and will report whatever
+it considers most important. Your job here is the opposite one: completeness. Go through the changed
+files one at a time, and for each, name every instance of a problem you find rather than the worst
+one. A finding you leave out because it is smaller than another one is a finding nobody makes: the
+next round will not look at this diff again.
+SWEEP
+              ;;
+          esac
+          echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo
+          echo "## What the implementer says it did"; echo; cat "$LOGS/$TAG-implement.txt"; echo
+          echo "## The diff under review (since $BASE)"; echo '```diff'
+          head -c "$MAX_DIFF_BYTES" "$LOGS/$TAG-diff-$round.patch"; echo '```'
+        } | critic "$ctag" "$LOGS/$ctag.verdict.json" &
+      done
     done
     wait
+
+    # The union, written to the path the rest of the loop reads, so nothing downstream — the unanimity
+    # check, the fixer's findings sections, the retrospective's round table — needs to know a role ran
+    # twice. FAIL if either pass failed: a critic that fails closed on a crash still has to hold the
+    # issue back, and two passes must not be a way for one of them to be outvoted.
+    for role in "${CRITICS[@]}"; do
+      pa="$LOGS/$TAG-$role-${round}a.verdict.json"; pb="$LOGS/$TAG-$role-${round}b.verdict.json"
+      [ -f "$pa" ] && [ -f "$pb" ] || continue
+      jq -s '{ verdict:  ([.[].verdict] | map(. == "FAIL") | any | if . then "FAIL" else "PASS" end),
+               findings: ([.[].findings] | add | unique_by(.file + " " + .problem)) }' \
+        "$pa" "$pb" > "$LOGS/$TAG-$role-$round.verdict.json"
+      say "  $TAG-$role-$round: two passes unioned -> $(jq -r .verdict "$LOGS/$TAG-$role-$round.verdict.json") ($(jq -r '.findings|length' "$LOGS/$TAG-$role-$round.verdict.json") finding(s) from $(jq -r '.findings|length' "$pa")+$(jq -r '.findings|length' "$pb"))"
+    done
 
     # Unanimity, and it has to be unanimous the hard way: `critic` fails closed, so a crashed or
     # truncated invocation is a FAIL and holds the issue back rather than waving it through.

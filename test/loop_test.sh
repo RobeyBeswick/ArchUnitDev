@@ -93,6 +93,14 @@ run_retro() {
   RC=$?
 }
 
+# run_gate <base-rev>  -> exit status in RC, output in $ROOT/gate.out
+# gate.sh directly, with no loop around it: the fixture repo has no go.mod, so the Go toolchain steps
+# skip themselves and what runs is the reward-hacking guards, which is what these scenarios are about.
+run_gate() {
+  ( cd "$REPO" && env REPO="$REPO" BASE="$1" bash "$HARNESS/gate.sh" ) > "$ROOT/gate.out" 2>&1
+  RC=$?
+}
+
 in_head()  { git -C "$REPO" show "HEAD:$1" 2>/dev/null; }
 commits()  { git -C "$REPO" rev-list --count HEAD; }
 
@@ -453,11 +461,24 @@ scenario_retry() {
   want_grep "1 landed" "$ROOT/run.out" "and says how it went"
 
   # A fresh implementer on a moved base, not a fourth fix round: the retry gets the issue and the tree,
-  # and nothing from the attempt that stopped converging.
+  # and none of the first attempt's *work*.
   want_grep "2-retry-implement" "$STUB_DIR/calls" "the re-attempt ran an implementer of its own"
   contains "Blocking findings" "$(cat "$STUB_DIR/2-retry-implement.stdin")" \
-    && bad "the re-attempt was fed the first attempt's findings" \
-    || ok "the re-attempt was not fed the first attempt's findings"
+    && bad "the re-attempt was framed as a fix round" \
+    || ok "the re-attempt was not framed as a fix round"
+
+  # It does get the findings that were outstanding when the first attempt was parked. They are the
+  # paid-for account of why it failed, and leaving them on disk unread is how $40 went on re-deriving
+  # work that was already two-thirds approved.
+  want_grep "Outstanding findings from an earlier attempt" "$STUB_DIR/2-retry-implement.stdin" \
+            "the re-attempt is told an abandoned attempt exists"
+  want_grep "This needs what issue 3 provides" "$STUB_DIR/2-retry-implement.stdin" \
+            "with the finding that was outstanding when it was parked"
+  want_grep "you are not free to reproduce these" "$STUB_DIR/2-retry-implement.stdin" \
+            "framed as constraints rather than as a worklist"
+  want_grep "carrying 1 outstanding finding(s)" "$ROOT/run.out" "and the carry-over is narrated"
+  want_no_grep "Outstanding findings from an earlier attempt" "$STUB_DIR/2-implement.stdin" \
+            "while the first attempt of an issue has nothing to carry"
 
   # Both attempts' evidence survives. A human deciding whether the retry was the right call has only
   # these files to read, and the first attempt's are the half that says why it failed.
@@ -475,6 +496,17 @@ scenario_retry() {
   want_grep "2" "$LOGS/landed" "and is on the landed list"
   [ "$(commits)" = 3 ]; want $? "one commit for the issue that landed and one for the re-attempt"
   [ "$(grep -c '^2$' "$LOGS/skipped")" = 0 ]; want $? "no duplicate skip entry from the second attempt"
+
+  # And off is off. `${VAR:-1}` would substitute the default for a variable that is *set but empty*,
+  # so `RETRY_ABANDONED=` would silently leave the retry on — with the README telling you it is the
+  # way to turn it off. The knob has to distinguish unset from empty.
+  setup
+  printf '2\n3\n' > "$STUB_DIR/open-issues"
+  run_loop retry MAX_ISSUES=2 NO_PUSH=1 MAX_ROUNDS=1 RETRY_ABANDONED=
+  want_grep "#2 ABANDONED" "$ROOT/run.out" "with the retry off the issue is still abandoned"
+  want_no_grep "RE-ATTEMPT" "$ROOT/run.out" "and RETRY_ABANDONED= actually switches it off"
+  want_no_grep "2-retry-implement" "$STUB_DIR/calls" "so no second attempt is paid for"
+  grep -qx 2 "$LOGS/skipped"; want $? "and the issue is left for a human"
 }
 
 # MAX_SPEND: the only bound on an unattended run's cost that is denominated in the thing being spent.
@@ -483,11 +515,13 @@ scenario_retry() {
 # can state in advance.
 #
 # The stub charges $0.01 an implement and $0.02 a critic, so a clean issue costs $0.07 and a $0.10 cap
-# falls between the first and second boundary.
+# falls between the first and second boundary. DOUBLE_CRITICS= is pinned throughout rather than left at
+# its default: the subject here is the cap, and a scenario whose arithmetic moves when an unrelated
+# default changes how many critics run is a scenario that reports the wrong thing when it breaks.
 scenario_spend() {
   setup
   printf '2\n3\n4\n' > "$STUB_DIR/open-issues"
-  run_loop happy MAX_ISSUES=0 NO_PUSH=1 MAX_SPEND=0.10
+  run_loop happy MAX_ISSUES=0 NO_PUSH=1 MAX_SPEND=0.10 DOUBLE_CRITICS=
 
   want "$RC" "the run exits cleanly rather than dying at the cap"
   want_grep '$0.10 spend cap' "$ROOT/run.out" "the cap is narrated at startup, where an operator can see they set it"
@@ -509,16 +543,125 @@ scenario_spend() {
 
   # Per run, not per log directory. LOGS is long-lived and holds every batch ever run into it, so a cap
   # measured over the whole directory would refuse to start the second night after the first spent it.
-  run_loop happy MAX_ISSUES=0 NO_PUSH=1 MAX_SPEND=0.10
+  run_loop happy MAX_ISSUES=0 NO_PUSH=1 MAX_SPEND=0.10 DOUBLE_CRITICS=
   want_grep "=== issue #4" "$ROOT/run.out" "a fresh run starts at zero even though the log directory is already over the cap"
   want_grep "spend: \$0.07 this run" "$ROOT/run.out" "the final total counts this run"
   want_grep "\$0.21 in logs all told" "$ROOT/run.out" "and reports the log directory's lifetime spend as a separate number"
 
   # A cap that does not parse must not be treated as one. awk would compare it as a string, and the
   # operator would have a run they believe is capped and is not.
-  run_loop happy MAX_ISSUES=1 NO_PUSH=1 MAX_SPEND=lots
+  run_loop happy MAX_ISSUES=1 NO_PUSH=1 MAX_SPEND=lots DOUBLE_CRITICS=
   [ "$RC" = 1 ]; want $? "an unparseable cap is fatal in preflight"
   want_grep "is not a dollar amount" "$ROOT/run.out" "and says so"
+}
+
+# DOUBLE_CRITICS: one role, two concurrent passes in round 1, findings unioned.
+#
+# Three times the test critic has reported one of two findings that were both in front of it, and the
+# one it left out cost a full round each time. This is the structural answer, and what it must get
+# right is the union — a second pass whose extra finding is dropped on the floor is worse than not
+# running it, because it costs the same and reads as thoroughness.
+scenario_double_critic() {
+  setup
+  run_loop union MAX_ISSUES=1 NO_PUSH=1 DOUBLE_CRITICS=tests
+
+  want "$RC" "exits 0"
+  want_grep "2-tests-1a" "$STUB_DIR/calls" "the first pass ran"
+  want_grep "2-tests-1b" "$STUB_DIR/calls" "and the second"
+  want_no_grep "2-review-1a" "$STUB_DIR/calls" "a role not named in DOUBLE_CRITICS runs once"
+  want_grep "two passes unioned -> FAIL (2 finding(s) from 1+1)" "$ROOT/run.out" \
+            "both findings survive the union, and the merge is narrated"
+
+  # Only the second pass is told to sweep. Two identical prompts are the weakest way to spend twice.
+  want_no_grep "For this pass specifically" "$STUB_DIR/2-tests-1a.stdin" "the first pass gets the ordinary prompt"
+  want_grep "For this pass specifically" "$STUB_DIR/2-tests-1b.stdin" "the second is told to be exhaustive"
+  want_grep "name every instance of a problem you find" "$STUB_DIR/2-tests-1b.stdin" "with the framing that differs from pass one"
+
+  # The point of the union: the fixer is handed both, in one round.
+  want_grep "The most important thing." "$STUB_DIR/2-fix-1.stdin" "the fixer got the first pass's finding"
+  want_grep "The second thing, which only an exhaustive pass finds." "$STUB_DIR/2-fix-1.stdin" \
+            "and the second pass's, in the same round"
+
+  # Downstream reads one verdict file per role per round and must not have to know about this.
+  [ -f "$LOGS/2-tests-1.verdict.json" ]; want $? "the canonical verdict path is written"
+  [ "$(jq -r '.findings | length' "$LOGS/2-tests-1.verdict.json")" = 2 ]; want $? "and holds both findings"
+  [ -f "$LOGS/2-tests-1a.verdict.json" ] && [ -f "$LOGS/2-tests-1b.verdict.json" ]
+  want $? "each pass's own verdict is kept as evidence"
+  want_grep "round 1: review=PASS idiom=PASS tests=FAIL" "$ROOT/run.out" "the unanimity check reads the merged verdict"
+  want_grep "#2 DONE" "$ROOT/run.out" "and the issue lands in round 2"
+  [ "$(grep -c -- '-tests-2' "$STUB_DIR/calls")" = 1 ]; want $? "round 2 runs the role once, not twice"
+
+  # Off is off — this doubles the cost of a role, so it has to be switchable in one place.
+  setup
+  run_loop union MAX_ISSUES=1 NO_PUSH=1 DOUBLE_CRITICS= MAX_ROUNDS=1
+  want_no_grep "2-tests-1b" "$STUB_DIR/calls" "DOUBLE_CRITICS= runs every role once"
+  want_no_grep "two passes unioned" "$ROOT/run.out" "and nothing is merged"
+}
+
+# The gate's kind-pinning guard, which exists because a model found this by hand and charged $5 for it.
+#
+# Every test in the target repo compares `Kind()` against the constant, which is a tautology: respell
+# the constant and the suite stays green, including respelling it onto a collision with a sibling kind.
+# Base-relative, because the tree already contains one such constant — landed in #20 with all three
+# critics passing it — and a guard that failed on it would blame the next issue's implementer.
+scenario_kind_pinning() {
+  setup
+
+  # A kind whose literal no test asserts, present at the base commit.
+  mkdir -p "$REPO/assertion"
+  cat > "$REPO/assertion/kinds.go" <<'GO'
+package assertion
+
+const KindOldUnpinned ViolationKind = "old-unpinned"
+GO
+  git -C "$REPO" add -A && git -C "$REPO" commit -q -m "a kind nobody pinned"
+  local base; base=$(git -C "$REPO" rev-parse HEAD)
+
+  run_gate "$base"
+  want "$RC" "a hole that is already at the base commit does not fail the gate"
+  want_grep "unpinned at the base commit too" "$ROOT/gate.out" "and is reported as pre-existing rather than silently ignored"
+
+  # ...whereas adding one is what the guard is for.
+  cat >> "$REPO/assertion/kinds.go" <<'GO'
+
+const KindBrandNew ViolationKind = "brand-new"
+GO
+  run_gate "$base"
+  [ "$RC" != 0 ]; want $? "adding an unpinned kind fails the gate"
+  want_grep "VIOLATION: the string value of KindBrandNew" "$ROOT/gate.out" "the violation names the constant"
+  want_no_grep "KindOldUnpinned is asserted nowhere" "$ROOT/gate.out" "and does not blame the implementer for the pre-existing one"
+
+  # A test comparing Kind() to the constant is the tautology, and must not satisfy the guard.
+  cat > "$REPO/assertion/kinds_test.go" <<'GO'
+package assertion
+
+func TestKind(t *testing.T) {
+  if got := New().Kind(); got != KindBrandNew {
+    t.Fatalf("got %v", got)
+  }
+}
+GO
+  run_gate "$base"
+  [ "$RC" != 0 ]; want $? "comparing Kind() against the constant does not count as pinning it"
+
+  # The literal does.
+  cat > "$REPO/assertion/kinds_test.go" <<'GO'
+package assertion
+
+func TestKind(t *testing.T) {
+  if got := New().Kind(); got != "brand-new" {
+    t.Fatalf("got %v", got)
+  }
+}
+GO
+  run_gate "$base"
+  want "$RC" "a literal assertion in a test satisfies it"
+
+  # Without a base there is nothing to be relative to, and a gate that guessed would either block
+  # every manual invocation or check nothing. It reports and passes.
+  run_gate ""
+  want "$RC" "no BASE means the guard reports rather than fails"
+  want_grep "reporting only" "$ROOT/gate.out" "and says which constants it looked at"
 }
 
 # The two silent-defeat guards in preflight: a Go repo whose lint enforcement is not actually there.
@@ -707,7 +850,7 @@ scenario_retro() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry spend pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
+ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry spend double_critic kind_pinning pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then
