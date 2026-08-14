@@ -367,7 +367,11 @@ scenario_preflight() {
   [ "$RC" -ne 0 ]; want $? "a Go repo with no .golangci.yml is rejected"
   want_grep "no .golangci.yml" "$ROOT/run.out" "and says why"
 
+  # Committed, like go.mod above and like the real thing: a lint config left uncommitted now trips
+  # the dirty-tree check before the linter checks this scenario is about are reached.
   printf 'version: "2"\n' > "$REPO/.golangci.yml"
+  git -C "$REPO" add -A && git -C "$REPO" commit -q -m "add .golangci.yml"
+
   run_loop happy PREFLIGHT_ONLY=1 LINT=golangci-lint-that-does-not-exist
   [ "$RC" -ne 0 ]; want $? "a missing linter binary is rejected"
   want_grep "is not installed" "$ROOT/run.out" "and says why"
@@ -431,6 +435,29 @@ scenario_relative_logs() {
   [ ! -e "$REPO/logs" ]; want $? "no log directory was created inside the target repo"
   contains "logs/" "$(git -C "$REPO" show --stat HEAD)"
   [ $? -ne 0 ]; want $? "and no logs were committed into the target repo by git add -A"
+}
+
+# Uncommitted work in the target repo when the run starts. `git add -A` at the end of each issue does
+# not distinguish it from the implementer's own edits, so it would land in the first issue's commit —
+# and the case this really guards is a second run started after one was killed mid-issue.
+scenario_dirty() {
+  setup
+  printf 'half an edit from a killed run\n' > "$REPO/WIP.txt"
+  printf 'and a modification to a tracked file\n' >> "$REPO/README.md"
+  run_loop happy MAX_ISSUES=1
+
+  [ "$RC" -ne 0 ]; want $? "refuses to start"
+  want_grep "uncommitted changes" "$ROOT/run.out" "and says why"
+  want_grep "WIP.txt" "$ROOT/run.out" "naming the files, so the fix is obvious"
+  [ ! -f "$STUB_DIR/calls" ]; want $? "no model invocation was made, so it costs nothing"
+  [ "$(commits)" = 1 ]; want $? "nothing was committed"
+
+  # The override, for the case where the changes are genuinely meant to go in.
+  run_loop happy MAX_ISSUES=1 ALLOW_DIRTY=1
+  want "$RC" "ALLOW_DIRTY=1 runs anyway"
+  want_grep "will be committed as part of the first issue" "$ROOT/run.out" "having said what it is about to do"
+  contains "WIP.txt" "$(git -C "$REPO" show --stat HEAD)"
+  want $? "and the pre-existing change is in the issue's commit, as warned"
 }
 
 # The evidence pack the retrospective reasons from. Every number in it is arithmetic over the
@@ -514,7 +541,7 @@ scenario_retro() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon nodiff no_push two_issues pushfail breaker preflight moduleproxy relative_logs retro_pack retro"
+ALL="happy fixround testcritic garbage abandon nodiff no_push two_issues pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then

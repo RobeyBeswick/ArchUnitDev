@@ -70,6 +70,23 @@ else
 fi
 [ -d "$REPO/.git" ] || die "$REPO is not a git repository (mount the target repo there, or set REPO)"
 
+# Uncommitted work in the target repo at startup is not the loop's to commit, and it will commit it:
+# each issue ends in `git add -A`, so whatever is already lying there lands in the first issue's
+# commit, described as that issue's implementation. Under NO_PUSH nobody sees it until review, and by
+# then the diff for the batch has someone else's half-finished edit sitting inside an unrelated
+# commit. The usual cause is a previous run killed mid-issue, which is exactly when a second run is
+# most likely to be started — and this is fatal rather than a warning because there is no way for the
+# loop to tell whose changes they are.
+if [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]; then
+  if [ -n "${ALLOW_DIRTY:-}" ]; then
+    say "WARNING: $REPO has uncommitted changes and ALLOW_DIRTY is set — they will be committed as part of the first issue"
+  else
+    die "$REPO has uncommitted changes, and the first issue's 'git add -A' would commit them as its own work:
+$(git -C "$REPO" status --short | head -20)
+Commit them, stash them, or 'git checkout .' — or set ALLOW_DIRTY=1 if they are genuinely meant to go in."
+  fi
+fi
+
 # The linter is where AGENTS.md's dependency rules, the purity rule and the doc-comment rules are
 # actually enforced. Both failure modes below are silent — the gate goes green while checking much
 # less than it claims to — which is exactly the kind of thing that must not be discovered in the
