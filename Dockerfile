@@ -11,7 +11,16 @@ ARG GOLANGCI_VERSION=v2.12.2
 ARG TARGETARCH
 ARG UID=1000
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# apt over TLS, before the first apt-get. The Debian base image points at http://deb.debian.org, and
+# the loop host only allows outbound 443 — so port 80 does not time out quickly and fail, it hangs
+# until apt gives up, and the build dies two minutes in on `Could not connect to deb.debian.org:80`.
+# Widening the security group to port 80 would fix it too; this is the fix that does not.
+# deb822 (bookworm's default) and the older one-line format are both rewritten, since which one is
+# present depends on the base image's build date. ca-certificates is already in the base image, which
+# it has to be for the https transport to verify anything.
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
+      /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null; \
+    apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq ripgrep awscli \
     && rm -rf /var/lib/apt/lists/*
 
