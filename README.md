@@ -307,8 +307,11 @@ machinery. The scenarios are:
 | `testcritic` | Only the third critic objects: its findings reach the fixer attributed to it, and the two that passed contribute no empty section. |
 | `garbage` | A critic returns unparseable output: fail closed, with a synthesised finding, never a silent pass. |
 | `abandon` | `MAX_ROUNDS` exhausted: work parked on `abandoned/issue-N`, pushed, repo reset to base, issue labelled and skipped, run carries on. |
+| `nodiff` | The implementer changes nothing: no critic and no fixer run, no commit, no empty branch, the issue is skipped and flagged, and the abandon line says *that* rather than blaming three rounds of review. |
 | `no_push` | `NO_PUSH=1` commits locally and touches nothing remote. |
 | `two_issues` | Two issues in one run: the queue advances, the second issue's base is the first one's commit, and each issue is implemented exactly once. |
+| `pushfail` | A failed push stops the run and leaves the issue open: the work is committed locally, so nothing is lost, but nothing is reported done. |
+| `breaker` | Consecutive abandonments stop the run before the rest of the queue is spent on a broken environment — and `MAX_CONSECUTIVE_ABANDONS=0` runs it out anyway. |
 | `preflight` | A Go repo with no `.golangci.yml`, and a missing linter binary, are both fatal — and `ALLOW_NO_LINT=1` overrides both. |
 | `moduleproxy` | An unresolvable module proxy warns and carries on rather than killing the run, names `GOPROXY=direct` as the fix, and the probe stays read-only. |
 | `relative_logs` | A relative `LOGS` — the invocation this README documents — still logs to the right place after the script cds into the target repo, and writes nothing into that repo. |

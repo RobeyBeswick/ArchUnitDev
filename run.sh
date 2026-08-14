@@ -304,6 +304,12 @@ while :; do
   } | work "$N-implement"
 
   approved=0
+  # Why the round loop stopped, when it stopped for a reason other than running out of rounds. It
+  # exists because the abandon message is the only account of the issue a human reads in the morning,
+  # and "ABANDONED after 3 rounds" is a false one for an issue that broke out of round 1 — it sends
+  # the reader looking for three verdicts that were never written, instead of at an implementer that
+  # returned without touching the tree.
+  abandon_reason=""
   for round in $(seq 1 "$MAX_ROUNDS"); do
 
     # 1. Deterministic gate. Never spend model tokens reviewing code that does not build.
@@ -323,6 +329,7 @@ while :; do
     git diff --cached "$BASE" > "$LOGS/$N-diff-$round.patch"
     if [ ! -s "$LOGS/$N-diff-$round.patch" ]; then
       say "  round $round: empty diff — the implementer changed nothing"
+      abandon_reason="the implementer changed nothing on round $round, so there was nothing to review"
       break
     fi
     if [ "$(wc -c < "$LOGS/$N-diff-$round.patch")" -gt "$MAX_DIFF_BYTES" ]; then
@@ -411,7 +418,9 @@ while :; do
     fi
   else
     # Abandon: keep the work on a branch so nothing is lost, reset main, move on.
-    say "#$N ABANDONED after $MAX_ROUNDS rounds — parking the work and leaving the issue open"
+    # Nor does this line claim the work was parked: there may be none to park, and the branch it
+    # would name is reported below, when there is.
+    say "#$N ABANDONED — ${abandon_reason:-no unanimous PASS in $MAX_ROUNDS rounds} — leaving the issue open"
     if ! git diff --cached --quiet "$BASE"; then
       branch="abandoned/issue-$N"
       git commit -q -m "WIP #$N: $TITLE" -m "Abandoned by the ArchUnitDev loop after $MAX_ROUNDS rounds. Needs a human."
