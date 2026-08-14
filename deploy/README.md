@@ -251,7 +251,7 @@ Not needed: `api.anthropic.com`. Inference goes to Bedrock.
 ## Instance sizing
 
 The loop is almost entirely waiting on the API. Two vCPUs is plenty — the only real work is `go build`
-and `go test` in the gate. Disk matters more than CPU: the image is ~1.9GB, plus the Go module cache
+and `go test` in the gate. Disk matters more than CPU: the image is ~2.1GB, plus the Go module cache
 and the logs, so give it 30GB.
 
 Memory is the one thing worth checking rather than assuming. The gate runs `go test -race`, and the race
