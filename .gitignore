@@ -1,2 +1,12 @@
 logs/
 *.debug.log
+
+# Terraform: the plugin cache is 650MB, and state describes real infrastructure (addresses, ARNs,
+# whatever a resource happens to return). The lock file is committed on purpose — it pins the provider
+# version, which is the point of it.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform.tfstate.lock.info
+crash.log

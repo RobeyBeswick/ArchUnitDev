@@ -5,121 +5,161 @@ short-lived dies partway through the night. An instance profile refreshes itself
 option that survives a full run unattended. `run.sh` refuses an unbounded run on static credentials
 rather than discovering the problem at 03:00.
 
-## 1. IAM role for the instance
+Everything below assumes the Terraform stack in `deploy/terraform/`, which builds the whole thing:
+network, instance, role, log bucket, image registry. The steps after it are the ones a human has to
+do — push an image, put a token in Secrets Manager, decide that tonight is the night.
 
-Create a role with `bedrock-invoke-policy.json` attached, trusted by `ec2.amazonaws.com`, and attach
-it to the instance as an instance profile.
-
-```bash
-ACCOUNT=<aws-account-id>
-
-aws iam create-role --role-name ArchUnitDevLoop \
-  --assume-role-policy-document '{
-    "Version":"2012-10-17",
-    "Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]
-  }'
-
-aws iam put-role-policy --role-name ArchUnitDevLoop \
-  --policy-name BedrockInvoke \
-  --policy-document file://bedrock-invoke-policy.json
-
-aws iam create-instance-profile --instance-profile-name ArchUnitDevLoop
-aws iam add-role-to-instance-profile \
-  --instance-profile-name ArchUnitDevLoop --role-name ArchUnitDevLoop
-
-aws ec2 associate-iam-instance-profile \
-  --instance-id "$INSTANCE_ID" \
-  --iam-instance-profile Name=ArchUnitDevLoop
-```
-
-## 2. Let the container reach IMDS
-
-This is the step that silently breaks everything. EC2 defaults to
-`http-put-response-hop-limit = 1`, and Docker's bridge network adds a hop — so the container cannot
-reach IMDS at all, and credentials simply never resolve.
+## 1. Provision it
 
 ```bash
-aws ec2 modify-instance-metadata-options \
-  --instance-id "$INSTANCE_ID" \
-  --http-tokens required \
-  --http-put-response-hop-limit 2
+cd deploy/terraform
+terraform init
+terraform plan          # 32 resources, nothing else touched
+terraform apply
 ```
 
-Running the container with `--network host` avoids it instead.
+The outputs are the four things you need afterwards: the `aws ssm start-session` command, the ECR
+repository URL, the log bucket, and the one-liner that creates the token secret.
 
-## 3. Put the target repo and the log directory on the instance
+**What it costs while it exists**, in round numbers per month: NAT gateway $32, the two interface
+endpoints $15, a `t3.medium` left running $30, 30GB of gp3 $2.50. So a stack left up idle is about
+$80/month and a stack up for one night is small change. `terraform destroy` when the batch is done —
+see section 9, which has the one wrinkle.
 
-Neither is in the image — both are bind-mounted, so they have to exist on the host first.
+**The GitHub token is not in Terraform**, on purpose: a secret in state is a secret in a git
+repository. Terraform grants the role read access to a secret *by name*; you create the secret
+yourself (section 4).
+
+`bedrock-invoke-policy.json` and `s3-logs-policy.json` are the same two policies as standalone
+documents, for attaching by hand to a role you made another way. Terraform inlines its own copies; if
+you change one, change the other.
+
+## 2. What "nothing public" means here
+
+| Decision | Effect |
+|---|---|
+| Private subnet, `associate_public_ip_address = false` | The instance has no address reachable from the internet. Not a filtered one — none. |
+| Security group with `ingress = []` | Nothing inbound, and written as an explicit empty list so a rule added by hand gets taken away again on the next apply. |
+| NAT gateway for egress | One-way by construction: it has a public address, but a connection through it can only be opened from inside. |
+| Session Manager instead of SSH | No key pair to lose, no listening port. The agent connects *outbound*; a session is an authenticated API call, logged in CloudTrail. |
+| PrivateLink for Bedrock and Secrets Manager | The prompts, diffs and the token never traverse the public internet. |
+| S3 gateway endpoint | Free, and does double duty: the log sync writes through it, and ECR keeps image layers in S3, so image pulls use it too. |
+| Private ECR with scan-on-push | The image is pulled from inside the VPC rather than from a public registry. |
+| Bucket: Block Public Access, `BucketOwnerEnforced`, AES256, versioning, TLS-only policy | ACLs are disabled outright, so "public-read on one object" is not a mistake available to be made. |
+| IMDSv2 required, hop limit 2 | See below. |
+| Encrypted EBS, `delete_on_termination = false` | The volume is the only copy of the night's commits under `NO_PUSH`. |
+
+The **hop limit of 2** is the step that silently breaks everything if it is missed. EC2 defaults to 1,
+and Docker's bridge network adds a hop — so the container cannot reach IMDS at all and the Bedrock
+credentials never resolve. Terraform sets it to 2. Running the container with `--network host` avoids
+the problem a different way.
+
+Session Manager, SSM and the ECR *API* all reach AWS through the NAT gateway. Only the two services
+carrying content worth keeping off the public internet got an endpoint each; an endpoint per service
+would cost more per month than the rest of the plumbing is worth defending.
+
+## 3. Build the image and push it
+
+The image is not in the registry until you put it there. It has to be built somewhere the Go module
+proxy resolves — `proxy.golang.org` is blocked on the network this repository is developed on, so
+either use `GOPROXY=direct` locally, or build on the instance itself, which has clean egress:
 
 ```bash
-sudo dnf install -y docker git            # Amazon Linux 2023
-sudo systemctl enable --now docker
-sudo usermod -aG docker ec2-user          # log out and back in for this to take effect
+# locally, if proxy.golang.org is blocked but go.googlesource.com is not
+docker build --build-arg GOPROXY=direct -t archunitdev .
 
-git clone https://github.com/LukasNiessen/ArchUnitGo.git /home/ec2-user/ArchUnitGo
-mkdir -p /home/ec2-user/logs
+# then, with the terraform output
+REPO=$(terraform -chdir=deploy/terraform output -raw ecr_repository_url)
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "${REPO%%/*}"
+docker tag archunitdev "$REPO:latest"
+docker push "$REPO:latest"
 ```
 
-Two details that bite:
+Building on the instance is the simpler path if the local network fights you: the harness repository is
+not cloned there by the bootstrap (only the target repo is), so clone it, `docker build`, and skip the
+registry entirely — the image only ever needs to exist on the one host that runs it. ECR is there so
+the same image can be rebuilt and pushed from a machine with a working network.
 
-**Ownership.** The image runs as `dev`, UID 1000, and a bind mount carries the host's ownership
-straight through — so both directories must be owned by UID 1000 or the loop cannot write. On Amazon
-Linux `ec2-user` *is* 1000, so a clone made as `ec2-user` lines up. If you build with a different
-`--build-arg UID`, match it.
+## 4. Get on the box, and give it the token
 
-**The checked-out branch is the branch the loop works on.** `run.sh` commits to whatever is checked
-out and pushes `HEAD`; it never switches branches. A fresh clone is on `main`, which is what you want.
+```bash
+aws ssm start-session --target "$(terraform -chdir=deploy/terraform output -raw instance_id)"
+```
 
-## 4. Check before committing to a night
+Needs the Session Manager plugin locally (`brew install --cask session-manager-plugin`). If the
+session is refused, the instance is still booting — the SSM agent registers a minute or two after the
+instance reports running.
+
+Create the token secret once, from your own machine. A fine-grained PAT scoped to the one repository
+with contents and issues write is enough; a classic `repo` token is far more than the loop needs:
+
+```bash
+aws secretsmanager create-secret --region us-east-1 \
+  --name archunitdev/gh-token --secret-string 'github_pat_...'
+```
+
+On the instance, the bootstrap left the names in `/etc/profile.d/archunitdev.sh`, so:
+
+```bash
+export GH_TOKEN=$(aws secretsmanager get-secret-value \
+  --secret-id "$GH_TOKEN_SECRET" --query SecretString --output text)
+```
+
+`GH_TOKEN` is deliberately **not** baked into the image, and it is stripped from the environment of
+every model invocation — only the harness itself holds it, which is what stops an implementer from
+pushing or closing an issue on its own. Keep it that way: no token in `.git/config`, no
+`~/.git-credentials`, no mounted key. Those are all files an implementer can read; an environment
+variable the harness removes before it calls the model is not.
+
+## 5. Check before committing to a night
 
 ```bash
 docker run --rm -e GH_TOKEN -e PREFLIGHT_ONLY=1 \
-  -v /home/ec2-user/ArchUnitGo:/work/repo -v /home/ec2-user/logs:/work/logs \
-  archunitdev
+  -v "$REPO_DIR:/work/repo" -v "$LOGS_DIR:/work/logs" "$IMAGE"
 ```
 
-Costs nothing. You want `auth: Bedrock in us-east-1 as arn:aws:sts::…:assumed-role/ArchUnitDevLoop/…`
-and **no** static-credentials warning. Seeing `assumed-role/ArchUnitDevLoop` is the proof that the
-instance profile — not a leftover environment variable — is what answered.
+Costs nothing. You want `auth: Bedrock in us-east-1 as arn:aws:sts::…:assumed-role/archunitdev-loop/…`
+and **no** static-credentials warning. Seeing `assumed-role/archunitdev-loop` is the proof that the
+instance profile — not a leftover environment variable — is what answered. It is also the test for
+whether the Bedrock interface endpoint can serve the *global* inference profile: if inference fails
+here but works with `bedrock_vpc_endpoint = false`, that is why.
 
-## 5. Run it
+## 6. Run it
 
 ```bash
 nohup docker run --rm \
-  -e GH_TOKEN \
-  -v /home/ec2-user/ArchUnitGo:/work/repo \
-  -v /home/ec2-user/logs:/work/logs \
-  archunitdev > /home/ec2-user/logs/loop.out 2>&1 &
+  -e GH_TOKEN -e NO_PUSH=1 -e MAX_ISSUES=5 \
+  -v "$REPO_DIR:/work/repo" \
+  -v "$LOGS_DIR:/work/logs" \
+  "$IMAGE" > "$LOGS_DIR/loop.out" 2>&1 &
 
-tail -f /home/ec2-user/logs/run.log
+tail -f "$LOGS_DIR/run.log"
 ```
 
+`NO_PUSH=1` and a small `MAX_ISSUES` are the recommended shape for an unattended run: a batch of three
+to five issues you can read in the morning, rather than a 35-deep chain of unreviewed commits.
+Each issue is still recorded in `logs/landed`, so the queue advances; when you later push the batch,
+the `Closes #N` trailers close the issues, and the next run prunes `landed` of anything now closed.
+
 `loop.out` goes *inside* the log directory on purpose: it catches anything that dies before `run.sh`
-opens `run.log`, and putting it there means the log sync below picks it up with everything else.
+opens `run.log`, and putting it there means the log sync picks it up with everything else.
 
-`GH_TOKEN` is the only secret to pass, and it is deliberately **not** baked into the image. Note that
-it is stripped from the environment of every model invocation — only the harness itself holds it, which
-is what stops an implementer from pushing or closing an issue on its own.
+The branch that is checked out is the branch the loop works on — `run.sh` commits to whatever `HEAD`
+points at and never switches branches. A fresh clone is on `main`, which is what you want.
 
-## 6. Keep the logs
+## 7. Keep the logs
 
-The logs live on the instance's root EBS volume, which is deleted when the instance is terminated. That
-is the only copy of *why* anything happened: GitHub keeps the outcome — the commits, the closed issues —
-while the diff each critic judged, the verdict it returned and the gate output that preceded it are all
-in `logs/`. Roughly 400KB per issue, so the whole 44-issue backlog is about 15MB. Storing that is free;
-losing it is not recoverable.
+The logs live on the instance's root EBS volume. That is the only copy of *why* anything happened:
+GitHub keeps the outcome — the commits, the closed issues — while the diff each critic judged, the
+verdict it returned and the gate output that preceded it are all in `logs/`. Roughly 400KB per issue,
+so the whole backlog is about 15MB. Storing that is free; losing it is not recoverable.
 
-`deploy/log-sync.sh` copies it to S3 on a timer, host-side, alongside the container:
+`deploy/log-sync.sh` copies it to S3 on a timer, host-side, alongside the container. The role policy
+and the bucket already exist from Terraform, so this is the whole of it:
 
 ```bash
-aws s3 mb s3://archunitdev-logs --region us-east-1        # once; keep it private
-
-# edit deploy/s3-logs-policy.json to name the bucket, then:
-aws iam put-role-policy --role-name ArchUnitDevLoop \
-  --policy-name WriteLoopLogs --policy-document file://deploy/s3-logs-policy.json
-
-nohup env S3_LOGS=s3://archunitdev-logs/loop LOGS=/home/ec2-user/logs \
-  /harness/deploy/log-sync.sh > /home/ec2-user/log-sync.out 2>&1 &
+nohup env S3_LOGS="$S3_LOGS" LOGS="$LOGS_DIR" \
+  ~/ArchUnitDev/deploy/log-sync.sh > ~/log-sync.out 2>&1 &
 ```
 
 **On a timer, not at the end**, because the failure being insured against is the instance dying
@@ -130,15 +170,15 @@ it flush before exiting, so stopping the run loses nothing.
 
 Each run goes under its own `RUN_ID` prefix (a UTC timestamp) so that re-running an issue cannot
 silently overwrite the artifacts explaining what happened the first time. Set `RUN_ID` yourself to
-resume into an existing prefix after a restart. The alternative — a flat prefix with bucket versioning
-switched on — is equally good and needs no prefix bookkeeping.
+resume into an existing prefix after a restart. Bucket versioning is on as well, so the two protections
+are independent.
 
 The role policy is deliberately write-only: `PutObject` and a prefix-scoped `ListBucket`, which is all
-`aws s3 sync` needs to upload. Pulling the logs back down is something you do from your own machine
-with your own credentials:
+`aws s3 sync` needs to upload. No `GetObject` — pulling the logs back down is something you do from
+your own machine with your own credentials:
 
 ```bash
-aws s3 sync s3://archunitdev-logs/loop/20260814T220000Z ./logs-from-ec2
+aws s3 sync "s3://$(terraform -chdir=deploy/terraform output -raw log_bucket)/loop/20260814T220000Z" ./logs-from-ec2
 ```
 
 Note that `logs/skipped` and `logs/landed` are *state*, not output — the loop reads them to keep the
@@ -146,23 +186,67 @@ queue moving. They are synced with everything else, which is what makes a restor
 pick up where the dead one left off. Be careful restoring `landed` next to a repo whose local commits
 you did not also restore: the queue would skip work that no longer exists.
 
+## 8. Get the work back
+
+Under `NO_PUSH=1` the commits exist only on the instance, and there is no way to `git fetch` *from* it —
+that would need an inbound route, which is the thing this deployment does not have. Send the commits
+out the way everything else leaves, as a file:
+
+```bash
+# on the instance
+git -C "$REPO_DIR" bundle create "$LOGS_DIR/work.bundle" main
+```
+
+The next log sync carries it to S3. Then, on your machine:
+
+```bash
+aws s3 cp "s3://$(terraform -chdir=deploy/terraform output -raw log_bucket)/loop/<run-id>/work.bundle" ~/work.bundle
+git -C ~/Projects/ArchUnitGo fetch ~/work.bundle main:from-ec2   # an absolute path; fetch resolves it as a remote
+git -C ~/Projects/ArchUnitGo log --oneline main..from-ec2
+```
+
+A bundle is a complete, verifiable pack — `git fetch` checks that every commit's ancestry is present,
+so a truncated upload fails loudly rather than importing half a night. Review, then push from your
+laptop, which is where the credentials that can close issues live.
+
+Mounting the root volume on another instance also works and is the fallback if the box died before it
+could make a bundle. The volume survives termination by design.
+
+## 9. Tear it down
+
+```bash
+terraform destroy
+```
+
+One wrinkle: because the root volume is set not to delete on termination, `destroy` leaves it behind as
+an orphan Terraform no longer tracks — about $2.50/month until you remove it. That is the trade for not
+losing a night's commits to a mistyped command. When the work is safely off it:
+
+```bash
+aws ec2 describe-volumes --filters Name=status,Values=available \
+  --query 'Volumes[].[VolumeId,Size,CreateTime]' --output table
+aws ec2 delete-volume --volume-id vol-...
+```
+
+The log bucket and the ECR repository are both `force_destroy`, so `destroy` does remove those,
+including the logs. Pull anything you want to keep first.
+
 ## Egress
 
-If the instance has an egress policy, allow:
+The security group allows outbound 443 to anywhere and nothing else. Hostname allowlisting is not
+something a security group can do — they take CIDRs — and doing it properly would mean AWS Network
+Firewall at roughly $290/month, which is out of proportion to the risk on a box with no inbound route.
+If you do apply a policy somewhere that can express hostnames, this is the list:
 
 | Host | Why |
 |---|---|
 | `bedrock-runtime.*.amazonaws.com` | Inference. Wildcard, because the pinned model is a *global* inference profile and may route across regions. |
 | `github.com`, `api.github.com` | `gh` reads and closes issues; `git` pushes. |
 | `proxy.golang.org`, `sum.golang.org` | The gate runs `go build`, and the extractor depends on `golang.org/x/tools`. |
+| `*.amazonaws.com` | SSM for the shell, ECR for the image, S3 for the logs, Secrets Manager for the token. |
 | `raw.githubusercontent.com`, `objects.githubusercontent.com` | **`docker build` only.** The `golangci-lint` install script and the release tarball it fetches. Not needed once the image exists. |
 
 Not needed: `api.anthropic.com`. Inference goes to Bedrock.
-
-If the build host and the run host are the same and the policy is applied at the instance level, the
-two `githubusercontent.com` entries have to be open for the `docker build` and can be closed afterwards.
-Build the image somewhere else if that is awkward — `golangci-lint` is pinned by version in the
-`Dockerfile`, so the image is reproducible.
 
 ## Instance sizing
 
