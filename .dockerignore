@@ -8,6 +8,15 @@ logs/
 .git/
 .gitignore
 
+# The deployment stack describes how to build the host the image runs on; the image has no use for
+# it, and the provider plugin under .terraform/ is 650MB — it took the COPY layer from 24MB to 680MB
+# and the image from 1.9GB to 2.9GB before this line existed. State is excluded because it names real
+# infrastructure and there is no reason for a runner to carry that around.
+deploy/terraform/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+
 # Local scratch that must never end up in a runner image.
 .DS_Store
 *.env
