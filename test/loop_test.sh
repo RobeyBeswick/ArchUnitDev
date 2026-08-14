@@ -76,6 +76,23 @@ run_loop() {
   RC=$?
 }
 
+# run_retro [VAR=VAL ...] -- [issue ...]  -> exit status in RC, output in $ROOT/retro.out
+# The `--` is not decoration: retro.sh takes issue numbers as arguments and its knobs as environment,
+# so a single flat list would be ambiguous the first time an issue number looked like an assignment.
+run_retro() {
+  local envs=()
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  ( cd "${RUN_CWD:-.}" || exit 1
+    PATH="$STUBS:$PATH" \
+    env -u CLAUDE_CODE_USE_BEDROCK -u AWS_PROFILE -u AWS_SESSION_TOKEN \
+        ANTHROPIC_API_KEY=stub-key-not-used \
+        SCENARIO=happy STUB_DIR="$STUB_DIR" REPO="$REPO" LOGS="$LOGS" \
+        ${envs[@]+"${envs[@]}"} \
+        "$HARNESS/retro.sh" "$@" ) > "$ROOT/retro.out" 2>&1
+  RC=$?
+}
+
 in_head()  { git -C "$REPO" show "HEAD:$1" 2>/dev/null; }
 commits()  { git -C "$REPO" rev-list --count HEAD; }
 
@@ -416,9 +433,88 @@ scenario_relative_logs() {
   [ $? -ne 0 ]; want $? "and no logs were committed into the target repo by git add -A"
 }
 
+# The evidence pack the retrospective reasons from. Every number in it is arithmetic over the
+# artifacts, so the artifacts are written by hand here rather than by a run: that is the only way to
+# assert the arithmetic is right instead of merely self-consistent.
+scenario_retro_pack() {
+  setup
+  printf '# Cache the extraction graph\n\nbody enough to be a description\n' > "$LOGS/issue-11.md"
+  printf '# Something smaller\n\nalso a description\n'                      > "$LOGS/issue-2.md"
+  jq -n '{total_cost_usd: 0.5}' > "$LOGS/11-implement.json"
+  jq -n '{total_cost_usd: 0.5}' > "$LOGS/2-implement.json"
+
+  # #2: the gate failed in round 1, the fixer ran, round 2 was clean and all three critics passed.
+  printf 'VIOLATION: a test was deleted.\n' > "$LOGS/2-gate-1.txt"
+  jq -n '{total_cost_usd: 0.25}' > "$LOGS/2-fix-1.json"
+  : > "$LOGS/2-gate-2.txt"
+  printf '+++ b/a.go\n+++ b/a_test.go\n' > "$LOGS/2-diff-2.patch"
+  for role in review idiom tests; do
+    jq -n '{verdict:"PASS", findings: []}' > "$LOGS/2-$role-2.verdict.json"
+  done
+  printf '2\n' > "$LOGS/landed"
+
+  # #11: one round, gate clean, the test critic objected, and it was abandoned there.
+  : > "$LOGS/11-gate-1.txt"
+  printf '+++ b/graph.go\n' > "$LOGS/11-diff-1.patch"
+  jq -n '{verdict:"PASS", findings: []}' > "$LOGS/11-review-1.verdict.json"
+  jq -n '{verdict:"PASS", findings: []}' > "$LOGS/11-idiom-1.verdict.json"
+  jq -n '{verdict:"FAIL", findings: [{file:"g.go",problem:"p",fix:"f"}]}' > "$LOGS/11-tests-1.verdict.json"
+  printf '11\n' > "$LOGS/skipped"
+
+  run_retro PACK_ONLY=1 --
+
+  want "$RC" "exits 0"
+  # Glob order is lexical, so an unsorted list reads "11 2" — and then the report's own headings are
+  # in an order that matches nothing a human is looking at.
+  want_grep "Issues in this batch: 2 11" "$ROOT/retro.out" "issues discovered from artifacts, sorted numerically"
+  want_grep "Outcome: landed, issue left open (NO_PUSH)" "$ROOT/retro.out" "a landed-but-open issue is labelled as such"
+  want_grep "Outcome: ABANDONED" "$ROOT/retro.out" "an abandoned issue is not reported as landed"
+  want_grep "Total spend: \$0.75" "$ROOT/retro.out" "cost is summed across every invocation for the issue"
+  want_grep "round 1: gate FAILED (1 VIOLATION" "$ROOT/retro.out" "a failed gate round is identified, with the violation count"
+  want_grep "fixer ran" "$ROOT/retro.out" "and that the fixer was sent after it"
+  want_grep "round 2: gate clean" "$ROOT/retro.out" "a clean round is distinguished from a failed one"
+  want_grep "over 2 file(s)" "$ROOT/retro.out" "the diff size and file count come from the patch"
+  want_grep "tests FAIL (1 finding(s))" "$ROOT/retro.out" "per-critic verdicts and finding counts are per round"
+  want_no_grep "round 3" "$ROOT/retro.out" "rounds that never ran are not invented"
+}
+
+# The retrospective end to end, off the back of a real batch: RETRO=1 must review *this* batch, must
+# not be able to fail the run, and must be as token-starved as every other model invocation.
+scenario_retro() {
+  setup
+  printf '2\n3\n' > "$STUB_DIR/open-issues"
+  # A stale artifact from an earlier batch into the same log directory. The retrospective must not
+  # pick it up: LOGS accumulates, and "which issues did tonight touch" is a different question.
+  jq -n '{total_cost_usd: 9.99}' > "$LOGS/7-implement.json"
+
+  run_loop happy MAX_ISSUES=2 RETRO=1 GH_TOKEN=stub-token-must-not-leak
+
+  want "$RC" "exits 0"
+  want_grep "retro: reviewing issue(s) 2 3" "$ROOT/run.out" "the retrospective ran on the batch that just landed"
+  report=$(echo "$LOGS"/retro-*.md)
+  [ -f "$report" ]; want $? "a report was written to the log directory"
+  want_grep "## Verdict" "$report" "and it is the model's markdown, not the envelope"
+  want_grep "## Verdict" "$ROOT/run.out" "the report is on stdout too, so nohup catches it for the log sync"
+
+  pack=$(echo "$STUB_DIR"/retro-*.stdin)
+  want_grep "You are reviewing" "$pack" "the prompt reached the invocation"
+  want_grep "Issue #2" "$pack" "the pack covers the batch"
+  want_grep "Issue #3" "$pack" "both of it"
+  want_no_grep "Issue #7" "$pack" "and not an issue from an earlier batch in the same log directory"
+  want_grep "round 1: gate clean" "$pack" "with the per-round evidence"
+
+  # The harness's one enforced boundary, asserted for every invocation the run made rather than
+  # described in a comment: a prompt says "do not push", `env -u GH_TOKEN` is what means it cannot.
+  if grep -qv '(unset)$' "$STUB_DIR/tokens" 2>/dev/null; then
+    bad "GH_TOKEN reached a model invocation: $(grep -v '(unset)$' "$STUB_DIR/tokens" | head -1)"
+  else
+    ok "GH_TOKEN reached no model invocation, retrospective included"
+  fi
+}
+
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon nodiff no_push two_issues pushfail breaker preflight moduleproxy relative_logs"
+ALL="happy fixround testcritic garbage abandon nodiff no_push two_issues pushfail breaker preflight moduleproxy relative_logs retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then

@@ -25,6 +25,11 @@ for the lowest-numbered open issue:
                       └────────── fixer ◀──────────┘   × MAX_ROUNDS
                                                        │ exhausted
                                     park on abandoned/issue-N, label needs-human, move on
+
+once the batch is done, if RETRO=1:
+
+    retro.sh ──▶ reads every artifact the batch left ──▶ a report proposing changes to the harness
+                 (read-only: it judges the prompts, it does not edit them)
 ```
 
 **There is no state store.** The queue is "the lowest-numbered open issue", progress is the git history,
@@ -260,6 +265,41 @@ Reopening an issue is how a human says the work was not good enough; a permanent
 that reopened issue invisible to the queue for ever, with the run cheerfully reporting an empty backlog.
 An entry for an issue that is still open is left alone, which is the case the file exists for.
 
+## The retrospective
+
+The critics judge each diff. Nothing judged the *loop* — whether a round was wasted, whether a critic
+that fails everything is pointing at a missing lint rule, whether three passes let something through
+— and that has so far been a human reading `logs/` by hand. `retro.sh` is that pass:
+
+```bash
+RETRO=1 MAX_ISSUES=3 ./run.sh     # at the end of the batch
+./retro.sh 11 12 13               # or afterwards, on any batch already in logs/
+./retro.sh                        # every issue this log directory holds artifacts for
+PACK_ONLY=1 ./retro.sh            # the evidence, without spending anything on the model
+```
+
+It is worth understanding what it is and is not:
+
+* **It reviews the machinery, not the code.** Its subject is `prompts/*.md`, `gate.sh` and the round
+  structure. The code already had three critics and a gate.
+* **It is cross-issue, which is where the signal is.** "The idiom critic blocked all three issues over
+  the same convention" is an argument for a lint rule in the target repo, paid for once, instead of a
+  judgement bought again on every issue. One issue cannot tell you that.
+* **The numbers are computed, not summarised.** Rounds, verdicts, finding counts, gate outcomes and
+  costs come out of the artifacts in bash before the model sees anything, so the report can be checked
+  against the same files. `PACK_ONLY=1` prints exactly what it was given.
+* **It is read-only by tool restriction**, like the critics — `Read,Grep,Glob`. A pass that edits the
+  prompts it is judging is one nobody can audit, and it would be rewriting files a running loop has
+  open. It proposes; you decide.
+* **It cannot fail the run.** It goes last, after the spend line, and its exit status is discarded. The
+  batch has already landed by then, and a retrospective that crashes must not turn a good night into a
+  failed one.
+* **"No change needed" is a valid report**, and the prompt says so explicitly. Otherwise it invents
+  work to justify itself, which is worse than not running it.
+
+One batch of three is an observation, not a trend — the prompt is told to say "observed once" rather
+than dress a single instance up as a pattern. It gets more useful the more issues it has to look across.
+
 ## Knobs
 
 All environment variables, all with defaults that work:
@@ -280,6 +320,8 @@ All environment variables, all with defaults that work:
 | `LINT` | `golangci-lint` | The linter binary. Only worth setting to test the fallback path. |
 | `ALLOW_NO_LINT` | unset | Run a Go repo without `golangci-lint` or without a `.golangci.yml`. Downgrades the architecture rules to greps. Do not use for an unattended run. |
 | `ALLOW_STATIC_CREDS` | unset | Permit an unbounded run on static temporary credentials, which will expire partway through the night. |
+| `RETRO` | unset | Run `retro.sh` on the batch when the run finishes: a report on the harness itself, not on the code. Costs one extra invocation and is only worth it once several issues have been through. |
+| `PACK_ONLY` | unset | `retro.sh` only. Print the evidence pack and exit without calling the model. |
 | `SKIP_MODULE_CHECK` | unset | Skip the preflight module-resolution probe. Worth setting only for an air-gapped run against a settled `go.mod`, where the warning is accurate but not actionable. |
 
 Work up in three steps rather than trusting a fresh container with a night:
@@ -315,6 +357,8 @@ machinery. The scenarios are:
 | `breaker` | Consecutive abandonments stop the run before the rest of the queue is spent on a broken environment — and `MAX_CONSECUTIVE_ABANDONS=0` runs it out anyway. |
 | `preflight` | A Go repo with no `.golangci.yml`, and a missing linter binary, are both fatal — and `ALLOW_NO_LINT=1` overrides both. |
 | `moduleproxy` | An unresolvable module proxy warns and carries on rather than killing the run, names `GOPROXY=direct` as the fix, and the probe stays read-only. |
+| `retro_pack` | The evidence pack is arithmetic over hand-written artifacts: issues sorted numerically rather than lexically (`2` before `11`), landed-but-open told apart from abandoned, per-round gate outcomes and per-critic verdicts, cost summed per issue, and rounds that never ran not invented. |
+| `retro` | `RETRO=1` reviews the batch that just landed and not an earlier batch's artifacts in the same log directory, writes its report to `logs/` and to stdout, and cannot fail the run. Also the one place the suite asserts that `GH_TOKEN` reaches no model invocation at all — the harness's only enforced boundary. |
 | `relative_logs` | A relative `LOGS` — the invocation this README documents — still logs to the right place after the script cds into the target repo, and writes nothing into that repo. |
 
 ```bash
@@ -332,6 +376,7 @@ what the harness actually put in each prompt, and edits the working tree so the 
 
 Roughly 4–9 invocations per issue (one implementer, three critics and one fixer per round). Budget on the
 order of a few dollars per issue, and the run prints the total from the JSON envelopes at the end.
+`RETRO=1` adds one invocation per *batch*, not per issue, and reads artifacts rather than the repository.
 
 **There is deliberately no per-invocation spend cap.** There was one (`--max-budget-usd`) and it was
 removed: an invocation that hits a cap is killed mid-edit, which for the implementer means a half-written

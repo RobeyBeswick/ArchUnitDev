@@ -249,6 +249,10 @@ findings_text() {
 
 done_count=0
 attempted=0
+# The issues *this* run touched, which is not the same as the issues the log directory holds
+# artifacts for: a long-lived LOGS accumulates every batch ever run into it. RETRO=1 reviews this
+# batch, so it needs the list rather than the count.
+attempted_issues=()
 consecutive_abandons=0
 while :; do
   [ "$MAX_ISSUES" -gt 0 ] && [ "$done_count" -ge "$MAX_ISSUES" ] && { say "hit MAX_ISSUES=$MAX_ISSUES"; break; }
@@ -438,7 +442,21 @@ while :; do
     consecutive_abandons=$((consecutive_abandons + 1))
   fi
   attempted=$((attempted + 1))
+  attempted_issues+=("$N")
 done
 
 say "run finished: $done_count issue(s) landed, $(wc -l < "$SKIPPED" | tr -d ' ') abandoned"
 say "total spend: \$$(jq -s '[.[].total_cost_usd // 0] | add' "$LOGS"/*.json 2>/dev/null)"
+
+# The retrospective on the batch — the loop reviewing itself rather than the code. Off by default:
+# it costs a model invocation and it is only worth anything once several issues have been through.
+#
+# Last, and non-fatal, deliberately. Everything above has already landed, so a retrospective that
+# crashes must not turn a successful night into a failed one — and it must not be able to change the
+# exit status a caller reads to decide whether the batch worked.
+if [ -n "${RETRO:-}" ] && [ "${#attempted_issues[@]}" -gt 0 ]; then
+  REPO="$REPO" LOGS="$LOGS" MAX_ROUNDS="$MAX_ROUNDS" MODEL="$MODEL" \
+    FALLBACK_MODEL="$FALLBACK_MODEL" TIMEOUT="$TIMEOUT" \
+    "$HARNESS/retro.sh" "${attempted_issues[@]}" \
+    || say "retro: failed — the batch above is unaffected"
+fi
