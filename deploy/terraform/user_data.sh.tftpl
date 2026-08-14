@@ -3,25 +3,64 @@
 # First-boot bootstrap for the loop host. Runs once, as root; its output is in
 # /var/log/cloud-init-output.log, which is the first place to look if the instance comes up unusable.
 #
-# It deliberately stops short of starting the loop. A run costs real money and commits to a night of
-# unattended work, so it is started by a human who has seen a PREFLIGHT_ONLY=1 pass.
+# It deliberately stops short of building the image and starting the loop. A run costs real money and
+# commits to a night of unattended work, so it is started by a human who has seen a PREFLIGHT_ONLY=1
+# pass.
 set -euxo pipefail
 
 dnf install -y docker git
 systemctl enable --now docker
 usermod -aG docker ec2-user
 
-# Both are bind-mounted into the container, and a bind mount carries the host's ownership straight
-# through: the image runs as uid 1000, which is ec2-user here, so anything cloned or created as
-# ec2-user is writable by the loop and anything created as root is not.
+# Bind-mounted into the container, and a bind mount carries the host's ownership straight through: the
+# image runs as uid 1000, which is ec2-user here, so anything created as ec2-user is writable by the
+# loop and anything created as root is not.
 install -d -o ec2-user -g ec2-user /home/ec2-user/logs
-if [ ! -d /home/ec2-user/ArchUnitGo ]; then
-  sudo -u ec2-user git clone ${target_repo} /home/ec2-user/ArchUnitGo
-fi
+
+# --- the clones --------------------------------------------------------------------------------
+#
+# Both repositories are private — the target repo is owned by someone else and read through a
+# collaborator's token — so a token is needed even to read them. This script runs under `set -x` and
+# /var/log/cloud-init-output.log is world-readable, so the whole shape below exists to keep the token
+# out of three places at once:
+#
+#   * out of the trace. Exactly one line holds the value, and it is the one inside `set +x`.
+#     Everything after works from `have_token`, a yes/no that is safe to print. Wrapping the *uses*
+#     instead was the first attempt and it leaked: `[ -z "$token" ]` is traced with the value
+#     expanded, before any guard inside the function can run.
+#   * out of argv. `sudo --preserve-env` passes it in the environment, so it never reaches a command
+#     line, where any local `ps` would read it. The credential helper below is single-quoted, so what
+#     is traced is the literal string `$GH_TOKEN`, not what it holds.
+#   * out of .git/config. Putting the token in the clone URL is what lands it there — and .git/config
+#     is a file the implementer agent can read, which would undo the whole point of stripping
+#     GH_TOKEN from every model invocation. A one-shot `git -c` is not written to the new repository.
+set +x
+export GH_TOKEN="$(aws secretsmanager get-secret-value --region ${region} \
+  --secret-id ${gh_token_secret_name} --query SecretString --output text 2>/dev/null || true)"
+if [ -n "$GH_TOKEN" ]; then have_token=yes; else have_token=no; fi
+set -x
+
+clone_private() {
+  local url="$1" directory="$2"
+  if [ -d "$directory" ]; then
+    return 0
+  fi
+  if [ "$have_token" != yes ]; then
+    echo "bootstrap: no token readable at ${gh_token_secret_name}, so $url was not cloned"
+    return 0
+  fi
+  sudo -u ec2-user --preserve-env=GH_TOKEN \
+    git -c 'credential.helper=!f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f' \
+    clone "$url" "$directory"
+}
+
+clone_private "${target_repo}" /home/ec2-user/ArchUnitGo
+clone_private "${harness_repo}" /home/ec2-user/ArchUnitDev
+unset GH_TOKEN
 
 aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${registry}
 docker pull ${image} \
-  || echo "bootstrap: ${image} is not in the registry yet. Build and push it, then pull it by hand."
+  || echo "bootstrap: ${image} is not in the registry yet. Build it from ~/ArchUnitDev and tag it."
 
 # The values the operator's commands need, so none of them has to be typed from memory at 22:00.
 cat > /etc/profile.d/archunitdev.sh <<'PROFILE'
@@ -29,8 +68,9 @@ export IMAGE="${image}"
 export S3_LOGS="s3://${log_bucket}/loop"
 export GH_TOKEN_SECRET="${gh_token_secret_name}"
 export REPO_DIR="/home/ec2-user/ArchUnitGo"
+export HARNESS_DIR="/home/ec2-user/ArchUnitDev"
 export LOGS_DIR="/home/ec2-user/logs"
 PROFILE
 chmod 0644 /etc/profile.d/archunitdev.sh
 
-echo "bootstrap: done. Connect with Session Manager and see deploy/README.md section 5."
+echo "bootstrap: done. Connect with Session Manager and see deploy/README.md."

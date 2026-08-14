@@ -34,15 +34,27 @@ variable "target_repo" {
   default     = "https://github.com/LukasNiessen/ArchUnitGo.git"
 }
 
+variable "harness_repo" {
+  description = <<-EOT
+    This repository, cloned onto the instance at boot. The image is built from it, and log-sync.sh is
+    run out of it — the instance needs the harness as source, not only as an image.
+  EOT
+  type        = string
+  default     = "https://github.com/RobeyBeswick/ArchUnitDev.git"
+}
+
 variable "gh_token_secret_name" {
   description = <<-EOT
     Secrets Manager secret holding the GitHub token, as a plain string. Created outside Terraform on
     purpose: a secret in state or in a .tf file is a secret in a git repository. Create it with
 
-      aws secretsmanager create-secret --name archunitdev/gh-token --secret-string 'github_pat_...'
+      aws secretsmanager create-secret --name archunitdev/gh-token --secret-string 'ghp_...'
 
-    A fine-grained PAT scoped to the target repository alone, with Contents and Issues read/write, is
-    the right token here — not a personal OAuth token that can reach every repository you have.
+    It has to be a *classic* PAT with the `repo` scope, and the reason is not preference: the target
+    repository is owned by another account and reached as a collaborator, and a fine-grained token can
+    only ever reach resources owned by the account that issued it. Give it the shortest expiry that
+    covers the run — it is revocable and expiring, which a personal OAuth token taken from `gh auth
+    token` is not without also breaking your own CLI login.
   EOT
   type        = string
   default     = "archunitdev/gh-token"

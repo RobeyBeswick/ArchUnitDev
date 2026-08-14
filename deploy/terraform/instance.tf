@@ -38,9 +38,19 @@ resource "aws_instance" "loop" {
     registry             = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.region}.amazonaws.com"
     image                = "${aws_ecr_repository.harness.repository_url}:${var.image_tag}"
     target_repo          = var.target_repo
+    harness_repo         = var.harness_repo
     log_bucket           = aws_s3_bucket.logs.id
     gh_token_secret_name = var.gh_token_secret_name
   })
+
+  # Terraform infers dependencies from references, and the instance references neither the NAT gateway
+  # nor the route table it is reached through — so without this it can boot, and run its whole
+  # bootstrap, before the private subnet has any route off the VPC. That is a race that resolves
+  # differently on a fast day than a slow one, which is the worst kind.
+  depends_on = [
+    aws_nat_gateway.main,
+    aws_route_table_association.private,
+  ]
 
   # Replacing the instance because the bootstrap script changed would destroy the working tree with it.
   # The script only runs at first boot anyway, so a change to it is not a reason to rebuild the host.
