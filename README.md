@@ -319,6 +319,7 @@ All environment variables, all with defaults that work:
 | `MAX_DIFF_BYTES` | `400000` | Diff truncation point for the critics. |
 | `LINT` | `golangci-lint` | The linter binary. Only worth setting to test the fallback path. |
 | `ALLOW_NO_LINT` | unset | Run a Go repo without `golangci-lint` or without a `.golangci.yml`. Downgrades the architecture rules to greps. Do not use for an unattended run. |
+| `ALLOW_DIRTY` | unset | Start even though the target repo has uncommitted changes, accepting that the first issue's commit will contain them. |
 | `ALLOW_STATIC_CREDS` | unset | Permit an unbounded run on static temporary credentials, which will expire partway through the night. |
 | `RETRO` | unset | Run `retro.sh` on the batch when the run finishes: a report on the harness itself, not on the code. Costs one extra invocation and is only worth it once several issues have been through. |
 | `PACK_ONLY` | unset | `retro.sh` only. Print the evidence pack and exit without calling the model. |
@@ -359,6 +360,7 @@ machinery. The scenarios are:
 | `moduleproxy` | An unresolvable module proxy warns and carries on rather than killing the run, names `GOPROXY=direct` as the fix, and the probe stays read-only. |
 | `retro_pack` | The evidence pack is arithmetic over hand-written artifacts: issues sorted numerically rather than lexically (`2` before `11`), landed-but-open told apart from abandoned, per-round gate outcomes and per-critic verdicts, cost summed per issue, and rounds that never ran not invented. |
 | `retro` | `RETRO=1` reviews the batch that just landed and not an earlier batch's artifacts in the same log directory, writes its report to `logs/` and to stdout, and cannot fail the run. Also the one place the suite asserts that `GH_TOKEN` reaches no model invocation at all — the harness's only enforced boundary. |
+| `dirty` | Uncommitted changes in the target repo are fatal before any model is invoked, the files are named, and `ALLOW_DIRTY=1` runs anyway and commits them as warned. |
 | `relative_logs` | A relative `LOGS` — the invocation this README documents — still logs to the right place after the script cds into the target repo, and writes nothing into that repo. |
 
 ```bash
