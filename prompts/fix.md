@@ -16,7 +16,11 @@ reviewers — correctness, idiom and tests. Only the ones that found something g
 3. **Do not start new work.** No refactoring beyond the findings, no extra features, no cleanup of code
    nobody complained about. A fix round that grows the diff in unrelated places gives the reviewers new
    surface to object to and costs you the round.
-4. **Leave the checks clean.** Run them yourself before finishing — a second failed gate on the same
+4. **When a fix changes the exported surface, fix the prose it falsifies too.** Doc comments that count
+   or bound the surface — "three exported functions", "the whole surface", "X's exact twin", "only" —
+   are a finding waiting to happen, in whatever file they live in. Grep for them when your fix adds or
+   restricts an exported symbol; this is what most idiom findings in the #14-#26 batch were.
+5. **Leave the checks clean.** Run them yourself before finishing — a second failed gate on the same
    issue costs another round:
    ```
    go build ./... && go vet ./... && golangci-lint fmt --diff && golangci-lint run ./... \

@@ -207,4 +207,12 @@ version in round 1, and was a second mutation the test could not detect. Two fin
 one round apart, and the issue landed on the last round it had. Both were in front of the round-1
 reviewer. Enumerate the mutations the test misses, and report all of them.
 
+It happened again on #26, one level up: a whole *class* of defect reported one member at a time. Round
+1 was a re-export pinned by nothing; round 2 was a sibling re-export that did not forward its options
+bag — same file, same public-surface pattern, both in the round-1 diff, and the round-1 verdict even
+named the siblings it had compared against. So: **when a finding is an instance of a class — one
+unpinned delegation, one unforwarded options bag, one accessor handing out mutable state — grep the
+diff for every other instance of that class and list them all in the one finding.** One finding naming
+four call sites costs one round. Four findings a round apart cost four, and the issue has three.
+
 ---
