@@ -1,0 +1,25 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WriteLoopLogs",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": "arn:aws:s3:::CHANGE-ME-archunitdev-logs/loop/*"
+    },
+    {
+      "Sid": "ListOnlyTheLoopPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::CHANGE-ME-archunitdev-logs",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "loop/*"
+        }
+      }
+    }
+  ]
+}
