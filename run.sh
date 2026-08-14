@@ -338,12 +338,30 @@ while :; do
   # the reader looking for three verdicts that were never written, instead of at an implementer that
   # returned without touching the tree.
   abandon_reason=""
-  for round in $(seq 1 "$MAX_ROUNDS"); do
+  verdicts=""     # the last round's votes, for the branch message when the issue is abandoned
+  # MAX_ROUNDS is a bound on *fixes*, and the loop runs one more round than that so its last act is
+  # always a verdict rather than a fix. Bounding the rounds themselves instead means the final round
+  # votes, FAILs, pays a fixer to address the findings — and then abandons the issue without ever
+  # gating or reviewing what that fixer did. The first long batch lost both of its abandonments that
+  # way: #21 and #26, $38.64 of a $161.59 batch, both ending in a fix that completed, reported a
+  # green gate and addressed the only outstanding finding, parked on a branch with nobody having
+  # looked at it. The extra round costs one critic trio, and only on issues headed for abandonment —
+  # an issue that lands has already broken out of the loop on unanimous PASS.
+  #
+  # All the critics vote in that final round, not just the ones that FAILed. Re-running only the
+  # dissenters is cheaper and unsound: it would assemble unanimity out of verdicts on two different
+  # diffs, which is exactly the failure the round structure exists to prevent.
+  final_round=$((MAX_ROUNDS + 1))
+  for round in $(seq 1 "$final_round"); do
 
     # 1. Deterministic gate. Never spend model tokens reviewing code that does not build.
     # BASE lets the gate notice a deleted test; LOGS keeps the coverage profile out of the repo.
     if ! REPO="$REPO" BASE="$BASE" LOGS="$LOGS" "$HARNESS/gate.sh" > "$LOGS/$N-gate-$round.txt" 2>&1; then
       say "  round $round: gate failed"
+      if [ "$round" -eq "$final_round" ]; then
+        abandon_reason="the gate was still failing after $MAX_ROUNDS round(s) of fixes"
+        break
+      fi
       { cat "$HARNESS/prompts/fix.md"
         echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo
         echo "## Failing checks"; echo '```'; cat "$LOGS/$N-gate-$round.txt"; echo '```'
@@ -393,6 +411,11 @@ while :; do
     # 4. Fix, then round again. Only the critics that actually found something get a section: an
     # empty heading reads to the fixer as a reviewer with nothing to say, and this prompt's whole
     # job is to be actionable.
+    if [ "$round" -eq "$final_round" ]; then
+      say "  round $round:$verdicts — no fix after the last verdict, so this is where it stops"
+      abandon_reason="no unanimous PASS after $MAX_ROUNDS round(s) of fixes, the last of them reviewed"
+      break
+    fi
     say "  round $round:$verdicts — sending findings back"
     { cat "$HARNESS/prompts/fix.md"
       echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo
@@ -451,7 +474,11 @@ while :; do
     say "#$N ABANDONED — ${abandon_reason:-no unanimous PASS in $MAX_ROUNDS rounds} — leaving the issue open"
     if ! git diff --cached --quiet "$BASE"; then
       branch="abandoned/issue-$N"
-      git commit -q -m "WIP #$N: $TITLE" -m "Abandoned by the ArchUnitDev loop after $MAX_ROUNDS rounds. Needs a human."
+      # The reason and the final verdicts go in the message, because this branch is the handoff: the
+      # tip has been gated and judged, so whoever picks it up should be told what the last word on it
+      # actually was rather than having to go back to the log directory for it.
+      git commit -q -m "WIP #$N: $TITLE" \
+        -m "Abandoned by the ArchUnitDev loop: ${abandon_reason:-no unanimous PASS}.${verdicts:+ Final round:$verdicts.} Needs a human."
       git branch -f "$branch" HEAD
       [ -n "$NO_PUSH" ] || git push -q origin "$branch" || say "WARNING: could not push $branch"
       git reset -q --hard "$BASE"

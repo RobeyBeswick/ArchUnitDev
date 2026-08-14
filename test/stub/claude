@@ -98,6 +98,15 @@ case "$tag" in
         fi ;;
       always_fail)
         verdict_fail "feature-$issue.txt" "Still not right." "Try again." ;;
+      # Satisfied only by the third fix, so the verdict that decides this issue is the one taken after
+      # the last fix — the round that did not used to exist. Under a loop bounded at MAX_ROUNDS rounds
+      # this issue abandons with work that every critic would have passed.
+      late_pass)
+        acks=$(grep -c FIXROUND-ACK NOTES.md 2>/dev/null)
+        if [ "${acks:-0}" -ge 3 ]
+          then verdict_pass
+          else verdict_fail "feature-$issue.txt" "Not there yet." "Keep going."
+        fi ;;
       # The lowest issue in the queue is the one that cannot be satisfied; the rest are fine. A queue
       # that abandons its way through is what tells MAX_ISSUES apart from a bound on landings.
       fail_one)

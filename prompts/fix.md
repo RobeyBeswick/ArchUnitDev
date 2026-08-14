@@ -1,7 +1,8 @@
 # Role: implementer, fixing findings
 
 You are still working on the same issue in the ArchUnitGo repository. Your previous attempt is in the
-working tree. Below is either a set of failing checks or the blocking findings from two reviewers.
+working tree. Below is either a set of failing checks or the blocking findings from up to three
+reviewers — correctness, idiom and tests. Only the ones that found something get a section.
 
 **Read `AGENTS.md` first if you have not already.** Then fix what is listed, and nothing else.
 
