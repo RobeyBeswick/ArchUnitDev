@@ -163,6 +163,23 @@ unreachable in every batch that fills its bound — that is, every batch that go
 after `MAX_CONSECUTIVE_ABANDONS` trips, because a broken environment is the one case where spending
 again is certainly wrong. Set `RETRY_ABANDONED=` to switch it off.
 
+**The run can be bounded in dollars, not just in issues.** `MAX_ISSUES` bounds a count, and issues do
+not cost the same: one lands in two rounds for $8 and the next takes six rounds of fixes and critics for
+$60. So a night scoped by issue count has no ceiling anyone can state in advance — 18 issues is
+somewhere between $150 and $1,000. `MAX_SPEND=400` stops the run at the first issue boundary where this
+run's spend has reached $400, and every boundary narrates the running total whether or not a cap is set,
+so the answer to "what did last night cost" is in the log while it is still running rather than only at
+the end.
+
+It is checked *between* issues and deliberately nowhere else. An issue killed part-way through has an
+unjudged diff in the working tree and no branch to its name, which is the outcome the whole abandon path
+exists to prevent — so the cap bounds what the run *starts*, and overshooting by up to one issue is the
+price of never abandoning work mid-flight. Spend is summed from the `total_cost_usd` in each
+invocation's result JSON, counting only files newer than a marker touched at startup: `logs/` is
+long-lived and holds every batch ever run into it, so a cap measured over the directory would refuse to
+start tonight because last night spent it. For the same reason the end-of-run line reports this run's
+spend and the directory's lifetime spend as two separate numbers.
+
 ## Auth
 
 Inference goes through **Amazon Bedrock** (account `<aws-account-id>`, `us-east-1`). The image sets
@@ -339,6 +356,7 @@ All environment variables, all with defaults that work:
 | `MAX_ISSUES` | `0` | Issues to *attempt*, abandonments included — a bound on what the run touches and what it spends, not on how much of it lands. `0` = run until the queue is empty. Set to `1` for a smoke test. |
 | `MAX_CONSECUTIVE_ABANDONS` | `2` | Stop the run after this many issues are abandoned back to back, on the reasoning that a run of abandons is far more often a broken environment than several independently hard issues. `0` = never stop. |
 | `RETRY_ABANDONED` | `1` | Re-attempt each issue this run abandoned, once, after the queue is done — but only if something landed after it, so the re-attempt gets a base the first attempt did not have. Exempt from `MAX_ISSUES`; skipped entirely if the abandon breaker tripped. Empty = off. |
+| `MAX_SPEND` | `0` | Dollars *this run* may spend before it stops. Checked at issue boundaries only, so the run overshoots by at most one issue rather than ever interrupting one; measured from each invocation's `total_cost_usd`, counting only this run's artifacts. `0` = no cap. |
 | `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. |
 | `NO_PUSH` | unset | Commit locally, but do not push and do not close the issue. Use it for the first run. The issue is recorded in `logs/landed` so the queue still advances. |
 | `TIMEOUT` | `30m` | Wall clock per invocation. |
@@ -388,6 +406,7 @@ machinery. The scenarios are:
 | `preflight` | A Go repo with no `.golangci.yml`, and a missing linter binary, are both fatal — and `ALLOW_NO_LINT=1` overrides both. |
 | `moduleproxy` | An unresolvable module proxy warns and carries on rather than killing the run, names `GOPROXY=direct` as the fix, and the probe stays read-only. |
 | `bounded` | `MAX_ISSUES` counts attempts, not landings: a queue whose first issue abandons stops at the bound instead of reaching for another issue to make the numbers up, and a landing counts the same as an abandonment. Also that the retry phase runs despite a full bound while still not admitting an issue outside it. |
+| `spend` | `MAX_SPEND` stops the run at the first issue boundary past the cap, having finished the issue that crossed it rather than interrupting it, and never starts the next one. Also that the cap is per run and not per log directory — a second run into a directory already over the cap still works — that the final line separates this run's spend from the directory's, and that a cap which does not parse as a number is fatal in preflight rather than silently no-op. |
 | `retry` | An issue that cannot pass until the issue *after* it has landed — the dependency-ordered queue with a hole in it. It abandons, the next one lands over it, and the re-attempt on the batch's final tree passes: a fresh implementer with none of the first attempt's findings, both attempts' artifacts and parked branches intact side by side, and the skip list unwound because the issue no longer needs a human. `abandon` covers the other half, that an unchanged base is not re-attempted at all. |
 | `retro_pack` | The evidence pack is arithmetic over hand-written artifacts: issues sorted numerically rather than lexically (`2` before `11`), landed-but-open told apart from abandoned, per-round gate outcomes and per-critic verdicts, cost summed per issue, and rounds that never ran not invented. |
 | `retro` | `RETRO=1` reviews the batch that just landed and not an earlier batch's artifacts in the same log directory, writes its report to `logs/` and to stdout, and cannot fail the run. Also the one place the suite asserts that `GH_TOKEN` reaches no model invocation at all — the harness's only enforced boundary. |

@@ -477,6 +477,50 @@ scenario_retry() {
   [ "$(grep -c '^2$' "$LOGS/skipped")" = 0 ]; want $? "no duplicate skip entry from the second attempt"
 }
 
+# MAX_SPEND: the only bound on an unattended run's cost that is denominated in the thing being spent.
+# MAX_ISSUES bounds a count, and an issue's cost varies by more than an order of magnitude — 2 rounds
+# and $8, or 6 rounds of a hard one and $60 — so a night scoped by issue count has no ceiling anybody
+# can state in advance.
+#
+# The stub charges $0.01 an implement and $0.02 a critic, so a clean issue costs $0.07 and a $0.10 cap
+# falls between the first and second boundary.
+scenario_spend() {
+  setup
+  printf '2\n3\n4\n' > "$STUB_DIR/open-issues"
+  run_loop happy MAX_ISSUES=0 NO_PUSH=1 MAX_SPEND=0.10
+
+  want "$RC" "the run exits cleanly rather than dying at the cap"
+  want_grep '$0.10 spend cap' "$ROOT/run.out" "the cap is narrated at startup, where an operator can see they set it"
+  want_grep "spend so far this run: \$0.07 over 1 issue(s)" "$ROOT/run.out" \
+            "each issue boundary reports the running total"
+  want_grep "hit MAX_SPEND=\$0.10 (\$0.14 spent over 2 issue(s))" "$ROOT/run.out" \
+            "the cap fired at the first boundary past it, and said what it had spent"
+  want_grep "=== issue #2" "$ROOT/run.out" "the first issue ran"
+  want_grep "=== issue #3" "$ROOT/run.out" "the second issue ran, being under the cap when it started"
+  want_no_grep "=== issue #4" "$ROOT/run.out" "and the third was never started"
+  want_no_grep "4-implement" "$STUB_DIR/calls" "so nothing was paid for it"
+
+  # The issue that took the run over the cap still landed. A cap that stopped an issue mid-flight would
+  # leave an unjudged diff in the tree and no branch to its name, which is the one outcome the whole
+  # abandon path exists to prevent — so overshooting by up to one issue is the intended behaviour.
+  want_grep "#3 DONE" "$ROOT/run.out" "the issue that crossed the cap was finished, not interrupted"
+  [ "$(commits)" = 3 ]; want $? "both issues are committed"
+  want_no_grep "ABANDONED" "$ROOT/run.out" "nothing was abandoned by the cap"
+
+  # Per run, not per log directory. LOGS is long-lived and holds every batch ever run into it, so a cap
+  # measured over the whole directory would refuse to start the second night after the first spent it.
+  run_loop happy MAX_ISSUES=0 NO_PUSH=1 MAX_SPEND=0.10
+  want_grep "=== issue #4" "$ROOT/run.out" "a fresh run starts at zero even though the log directory is already over the cap"
+  want_grep "spend: \$0.07 this run" "$ROOT/run.out" "the final total counts this run"
+  want_grep "\$0.21 in logs all told" "$ROOT/run.out" "and reports the log directory's lifetime spend as a separate number"
+
+  # A cap that does not parse must not be treated as one. awk would compare it as a string, and the
+  # operator would have a run they believe is capped and is not.
+  run_loop happy MAX_ISSUES=1 NO_PUSH=1 MAX_SPEND=lots
+  [ "$RC" = 1 ]; want $? "an unparseable cap is fatal in preflight"
+  want_grep "is not a dollar amount" "$ROOT/run.out" "and says so"
+}
+
 # The two silent-defeat guards in preflight: a Go repo whose lint enforcement is not actually there.
 # A green gate that checks less than it claims is the worst outcome an overnight run can have, so
 # both of these must be fatal before any work starts, not warnings.
@@ -663,7 +707,7 @@ scenario_retro() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
+ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry spend pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then
