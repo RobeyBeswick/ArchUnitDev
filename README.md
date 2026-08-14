@@ -309,7 +309,7 @@ All environment variables, all with defaults that work:
 | `REPO` | `/work/repo` | Target repository. |
 | `LOGS` | `$HARNESS/logs` | Log directory. |
 | `MAX_ROUNDS` | `3` | Review/fix rounds before an issue is abandoned. |
-| `MAX_ISSUES` | `0` | `0` = run until the queue is empty. Set to `1` for a smoke test. |
+| `MAX_ISSUES` | `0` | Issues to *attempt*, abandonments included — a bound on what the run touches and what it spends, not on how much of it lands. `0` = run until the queue is empty. Set to `1` for a smoke test. |
 | `MAX_CONSECUTIVE_ABANDONS` | `2` | Stop the run after this many issues are abandoned back to back, on the reasoning that a run of abandons is far more often a broken environment than several independently hard issues. `0` = never stop. |
 | `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. |
 | `NO_PUSH` | unset | Commit locally, but do not push and do not close the issue. Use it for the first run. The issue is recorded in `logs/landed` so the queue still advances. |
@@ -358,6 +358,7 @@ machinery. The scenarios are:
 | `breaker` | Consecutive abandonments stop the run before the rest of the queue is spent on a broken environment — and `MAX_CONSECUTIVE_ABANDONS=0` runs it out anyway. |
 | `preflight` | A Go repo with no `.golangci.yml`, and a missing linter binary, are both fatal — and `ALLOW_NO_LINT=1` overrides both. |
 | `moduleproxy` | An unresolvable module proxy warns and carries on rather than killing the run, names `GOPROXY=direct` as the fix, and the probe stays read-only. |
+| `bounded` | `MAX_ISSUES` counts attempts, not landings: a queue whose first issue abandons stops at the bound instead of reaching for another issue to make the numbers up, and a landing counts the same as an abandonment. |
 | `retro_pack` | The evidence pack is arithmetic over hand-written artifacts: issues sorted numerically rather than lexically (`2` before `11`), landed-but-open told apart from abandoned, per-round gate outcomes and per-critic verdicts, cost summed per issue, and rounds that never ran not invented. |
 | `retro` | `RETRO=1` reviews the batch that just landed and not an earlier batch's artifacts in the same log directory, writes its report to `logs/` and to stdout, and cannot fail the run. Also the one place the suite asserts that `GH_TOKEN` reaches no model invocation at all — the harness's only enforced boundary. |
 | `dirty` | Uncommitted changes in the target repo are fatal before any model is invoked, the files are named, and `ALLOW_DIRTY=1` runs anyway and commits them as warned. |

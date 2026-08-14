@@ -355,6 +355,32 @@ scenario_breaker() {
   want_grep "0 issue(s) landed, 3 abandoned" "$ROOT/run.out" "and the summary is accurate"
 }
 
+# MAX_ISSUES bounds the issues a run attempts, including the ones it gives up on. An operator sets it
+# to scope a batch — "tonight, #14 to #25" — and to cap the spend, and an abandonment is the most
+# expensive outcome there is, so it has to count. Gating on landings instead is the kind of bug that
+# never shows up in a green run and only surfaces in the one you were watching least.
+scenario_bounded() {
+  setup
+  printf '2\n3\n' > "$STUB_DIR/open-issues"
+  run_loop fail_one MAX_ISSUES=1
+
+  want "$RC" "the run exits cleanly"
+  want_grep "hit MAX_ISSUES=1" "$ROOT/run.out" "the bound was reached"
+  want_grep "2-implement" "$STUB_DIR/calls" "the one issue in scope was attempted"
+  want_no_grep "3-implement" "$STUB_DIR/calls" "the abandonment did not buy the run a second issue"
+  want_grep "0 issue(s) landed, 1 abandoned" "$ROOT/run.out" "the summary is accurate"
+
+  # And a landing counts the same as an abandonment, which is the half that always worked.
+  setup
+  printf '2\n3\n4\n' > "$STUB_DIR/open-issues"
+  run_loop fail_one MAX_ISSUES=2 NO_PUSH=1
+
+  want "$RC" "the run exits cleanly"
+  want_grep "3-implement" "$STUB_DIR/calls" "the second issue was attempted"
+  want_no_grep "4-implement" "$STUB_DIR/calls" "and the third was not"
+  want_grep "1 issue(s) landed, 1 abandoned" "$ROOT/run.out" "one of each, inside a bound of two"
+}
+
 # The two silent-defeat guards in preflight: a Go repo whose lint enforcement is not actually there.
 # A green gate that checks less than it claims is the worst outcome an overnight run can have, so
 # both of these must be fatal before any work starts, not warnings.
@@ -541,7 +567,7 @@ scenario_retro() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon nodiff no_push two_issues pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
+ALL="happy fixround testcritic garbage abandon nodiff no_push two_issues bounded pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then

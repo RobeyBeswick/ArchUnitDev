@@ -98,6 +98,13 @@ case "$tag" in
         fi ;;
       always_fail)
         verdict_fail "feature-$issue.txt" "Still not right." "Try again." ;;
+      # The lowest issue in the queue is the one that cannot be satisfied; the rest are fine. A queue
+      # that abandons its way through is what tells MAX_ISSUES apart from a bound on landings.
+      fail_one)
+        if [ "$issue" = 2 ]
+          then verdict_fail "feature-$issue.txt" "Not right, and it will not become right." "Try again."
+          else verdict_pass
+        fi ;;
       *) echo "stub claude: unknown SCENARIO $SCENARIO" >&2; exit 64 ;;
     esac
     ;;

@@ -272,7 +272,14 @@ attempted=0
 attempted_issues=()
 consecutive_abandons=0
 while :; do
-  [ "$MAX_ISSUES" -gt 0 ] && [ "$done_count" -ge "$MAX_ISSUES" ] && { say "hit MAX_ISSUES=$MAX_ISSUES"; break; }
+  # Issues *attempted*, not issues landed. Gating on the landed count sounds equivalent and is not:
+  # every abandonment buys the run another issue, so a bounded batch quietly outgrows the range the
+  # operator scoped it to (12 issues over #14-#25, one abandonment, and it reaches for #26), and
+  # MAX_ISSUES=1 stops being a smoke test at exactly the moment its one issue gives up — which is
+  # when you want to read the logs, not spend again. What this knob bounds is what the run touches
+  # and what it costs, and an abandonment costs the most of all: an implement, MAX_ROUNDS of fixes,
+  # and every critic in between.
+  [ "$MAX_ISSUES" -gt 0 ] && [ "$attempted" -ge "$MAX_ISSUES" ] && { say "hit MAX_ISSUES=$MAX_ISSUES"; break; }
 
   # Two circuit breakers, both aimed at the same failure: the environment breaks partway through a
   # long queue and the loop keeps going, abandoning every remaining issue for a reason that has
