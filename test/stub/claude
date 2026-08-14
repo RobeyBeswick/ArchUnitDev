@@ -114,6 +114,17 @@ case "$tag" in
           then verdict_fail "feature-$issue.txt" "Not right, and it will not become right." "Try again."
           else verdict_pass
         fi ;;
+      # The lowest issue in the queue cannot be got right until the issue *after* it has landed: the
+      # backlog's dependency order with a hole in it, which is what an abandonment in the middle of an
+      # ordered queue leaves behind. No round of fixing helps, and the same implementer succeeds
+      # unchanged once the tree has the thing it was missing.
+      retry)
+        if [ "$issue" = 2 ] && [ ! -f feature-3.txt ]
+          then verdict_fail "feature-$issue.txt" \
+                 "This needs what issue 3 provides, and it is not in the tree." \
+                 "Nothing this round can do about it."
+          else verdict_pass
+        fi ;;
       *) echo "stub claude: unknown SCENARIO $SCENARIO" >&2; exit 64 ;;
     esac
     ;;

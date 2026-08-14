@@ -217,6 +217,13 @@ scenario_abandon() {
   [ -f "$STUB_DIR/closed" ] && bad "an abandoned issue was closed" || ok "the issue was left open"
   want_grep "no open issues left" "$ROOT/run.out" "the run moved on instead of retrying forever"
   want_grep "0 issue(s) landed, 1 abandoned" "$ROOT/run.out" "the summary is accurate"
+
+  # Nothing landed after this issue, so a re-attempt would run the same prompts over the same tree and
+  # fail the same way for the same reason. This is the case that keeps the retry phase from doubling
+  # the cost of a batch where everything abandons — which is what a broken environment looks like.
+  want_grep "leaving #2 alone — nothing landed after it" "$ROOT/run.out" \
+            "the retry phase declined to re-attempt it on an unchanged base"
+  want_no_grep "2-retry-implement" "$STUB_DIR/calls" "so no second attempt was paid for"
 }
 
 # The implementer returns having changed nothing. It is the likeliest way an issue in a dependency-
@@ -417,6 +424,57 @@ scenario_bounded() {
   want_grep "3-implement" "$STUB_DIR/calls" "the second issue was attempted"
   want_no_grep "4-implement" "$STUB_DIR/calls" "and the third was not"
   want_grep "1 issue(s) landed, 1 abandoned" "$ROOT/run.out" "one of each, inside a bound of two"
+  # The retry phase is exempt from the bound — a re-attempt of #2 is still #2 — and the exemption must
+  # not leak into the queue: #4 is out of scope whether or not the retry happens.
+  want_grep "2-retry-implement" "$STUB_DIR/calls" "the abandoned issue was re-attempted despite the bound being full"
+  want_no_grep "4-implement" "$STUB_DIR/calls" "and the exemption did not admit an issue outside the bound"
+}
+
+# One re-attempt of an abandoned issue, at the end, against the tree the batch actually finished on.
+#
+# The scenario is the real one: the backlog is numbered in dependency order and the loop moves on when
+# an issue is abandoned, so #2 fails for want of something #3 provides, #3 lands over it, and the tree
+# ends the batch with a hole in the middle of it that nothing points at. Here #2 becomes implementable
+# the moment #3's file exists, which is the cheapest faithful model of ArchUnitGo's #21: a Files API
+# terminal abandoned while five commits of the kernel it needed landed on top of it.
+scenario_retry() {
+  setup
+  printf '2\n3\n' > "$STUB_DIR/open-issues"
+  # MAX_ROUNDS=1 keeps it to two rounds an issue; the retry is the subject, not the round loop.
+  run_loop retry MAX_ISSUES=2 NO_PUSH=1 MAX_ROUNDS=1
+
+  want "$RC" "the run exits cleanly"
+  want_grep "#2 ABANDONED" "$ROOT/run.out" "the issue that needed later work was abandoned first time"
+  want_grep "#3 DONE"      "$ROOT/run.out" "the issue after it landed"
+  want_grep "hit MAX_ISSUES=2" "$ROOT/run.out" "the main pass ended on its bound"
+  want_grep "#2 RE-ATTEMPT" "$ROOT/run.out" "and the abandoned issue was then re-attempted"
+  want_grep "landed on the re-attempt" "$ROOT/run.out" "the re-attempt landed, which the first attempt could not"
+  want_grep "re-attempted 1 abandoned issue(s)" "$ROOT/run.out" "the summary accounts for the retry"
+  want_grep "1 landed" "$ROOT/run.out" "and says how it went"
+
+  # A fresh implementer on a moved base, not a fourth fix round: the retry gets the issue and the tree,
+  # and nothing from the attempt that stopped converging.
+  want_grep "2-retry-implement" "$STUB_DIR/calls" "the re-attempt ran an implementer of its own"
+  contains "Blocking findings" "$(cat "$STUB_DIR/2-retry-implement.stdin")" \
+    && bad "the re-attempt was fed the first attempt's findings" \
+    || ok "the re-attempt was not fed the first attempt's findings"
+
+  # Both attempts' evidence survives. A human deciding whether the retry was the right call has only
+  # these files to read, and the first attempt's are the half that says why it failed.
+  [ -f "$LOGS/2-implement.json" ];       want $? "the first attempt's artifacts are still there"
+  [ -f "$LOGS/2-retry-implement.json" ]; want $? "and the re-attempt's are beside them, not on top of them"
+  [ -f "$LOGS/2-tests-1.verdict.json" ] && [ -f "$LOGS/2-retry-tests-1.verdict.json" ]
+  want $? "each attempt kept its own round-1 verdicts"
+  git -C "$REPO" show "abandoned/issue-2:feature-2.txt" >/dev/null 2>&1
+  want $? "the first attempt's parked work was not overwritten by the second"
+
+  # Bookkeeping. The skip list is read as a set — by the queue, and by the retrospective to label an
+  # outcome — so an issue that has since landed must not still be in it.
+  grep -qx 2 "$LOGS/skipped" && bad "the issue that landed is still on the skip list" \
+                             || ok "the issue that landed was taken off the skip list"
+  want_grep "2" "$LOGS/landed" "and is on the landed list"
+  [ "$(commits)" = 3 ]; want $? "one commit for the issue that landed and one for the re-attempt"
+  [ "$(grep -c '^2$' "$LOGS/skipped")" = 0 ]; want $? "no duplicate skip entry from the second attempt"
 }
 
 # The two silent-defeat guards in preflight: a Go repo whose lint enforcement is not actually there.
@@ -605,7 +663,7 @@ scenario_retro() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
+ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then
