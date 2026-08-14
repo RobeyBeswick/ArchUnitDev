@@ -52,11 +52,18 @@ verdict_fail() {
 
 case "$tag" in
   *-implement)
-    # One file per issue, not one file for the run: with a fixed name and fixed contents a second
-    # issue rewrites byte-identical content, run.sh sees an empty diff, and the two-issue scenario
-    # would report a queue bug it does not have (or hide one it does).
-    printf 'a feature for issue %s, implemented by the stub\n' "$issue" > "feature-$issue.txt"
-    result "Added feature-$issue.txt."
+    # An implementer that returns having changed nothing — what a real one does when it reads the
+    # issue and finds the work already there. It still reports for duty and still costs money; the
+    # tree is what run.sh has to act on, not the prose.
+    if [ "$SCENARIO" = nodiff ]; then
+      result "Issue $issue is already implemented by the code that is there; I changed nothing."
+    else
+      # One file per issue, not one file for the run: with a fixed name and fixed contents a second
+      # issue rewrites byte-identical content, run.sh sees an empty diff, and the two-issue scenario
+      # would report a queue bug it does not have (or hide one it does).
+      printf 'a feature for issue %s, implemented by the stub\n' "$issue" > "feature-$issue.txt"
+      result "Added feature-$issue.txt."
+    fi
     ;;
 
   *-fix-*)

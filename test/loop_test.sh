@@ -164,7 +164,8 @@ scenario_abandon() {
   run_loop always_fail
 
   want "$RC" "exits 0"
-  want_grep "ABANDONED after 3 rounds" "$ROOT/run.out" "the issue was abandoned"
+  want_grep "ABANDONED — no unanimous PASS in 3 rounds" "$ROOT/run.out" \
+            "the issue was abandoned, and the reason given is the one that applies"
   for r in 1 2 3; do
     want_grep "2-fix-$r" "$STUB_DIR/calls" "fix round $r ran"
   done
@@ -184,6 +185,43 @@ scenario_abandon() {
   want_grep "needs-human" "$STUB_DIR/edited" "the issue was labelled for a human"
   [ -f "$STUB_DIR/closed" ] && bad "an abandoned issue was closed" || ok "the issue was left open"
   want_grep "no open issues left" "$ROOT/run.out" "the run moved on instead of retrying forever"
+  want_grep "0 issue(s) landed, 1 abandoned" "$ROOT/run.out" "the summary is accurate"
+}
+
+# The implementer returns having changed nothing. It is the likeliest way an issue in a dependency-
+# ordered backlog fails: the work was already done by an earlier issue, and the implementer says so
+# instead of inventing something. Everything downstream of the diff has to notice, because a critic
+# reviewing an empty diff has nothing to review and would pass it — and a PASS with no commit behind
+# it must never close an issue.
+scenario_nodiff() {
+  setup
+  run_loop nodiff MAX_ISSUES=1
+
+  want "$RC" "exits 0"
+  want_grep "round 1: gate clean" "$ROOT/run.out" "the gate still ran"
+  want_grep "round 1: empty diff — the implementer changed nothing" "$ROOT/run.out" \
+            "the empty diff was noticed"
+  # The account a human reads in the morning. "ABANDONED after 3 rounds" would send them looking for
+  # three verdicts that were never written, instead of at an implementer that touched nothing.
+  want_grep "ABANDONED — the implementer changed nothing on round 1" "$ROOT/run.out" \
+            "the abandon message gives the actual reason"
+  want_no_grep "no unanimous PASS in 3 rounds" "$ROOT/run.out" \
+               "and does not claim three review rounds ran"
+  want_no_grep "parked on branch" "$ROOT/run.out" "nothing was said to be parked, there being nothing to park"
+
+  # No round 2, and no model spent on a diff that is not there.
+  [ "$(grep -c . "$STUB_DIR/calls")" = 1 ]; want $? "the implementer ran once and nothing else ran at all"
+  want_no_grep "-fix-" "$STUB_DIR/calls" "no fixer was invoked"
+  want_no_grep "-review-" "$STUB_DIR/calls" "no critic was invoked"
+  [ -z "$(ls "$LOGS"/*.verdict.json 2>/dev/null)" ]; want $? "no verdict was recorded"
+
+  # And the issue is left exactly as it was found.
+  [ "$(commits)" = 1 ]; want $? "no commit was made"
+  git -C "$REPO" rev-parse --verify --quiet abandoned/issue-2 >/dev/null
+  [ $? -ne 0 ]; want $? "no empty branch was parked"
+  [ -f "$STUB_DIR/closed" ] && bad "an issue with no work behind it was closed" || ok "the issue was left open"
+  want_grep "2" "$LOGS/skipped" "the issue was skipped so the queue moves on"
+  want_grep "needs-human" "$STUB_DIR/edited" "and flagged for a human, who is the only one who can say why"
   want_grep "0 issue(s) landed, 1 abandoned" "$ROOT/run.out" "the summary is accurate"
 }
 
@@ -380,7 +418,7 @@ scenario_relative_logs() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon no_push two_issues pushfail breaker preflight moduleproxy relative_logs"
+ALL="happy fixround testcritic garbage abandon nodiff no_push two_issues pushfail breaker preflight moduleproxy relative_logs"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then
