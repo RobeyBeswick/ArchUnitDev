@@ -45,11 +45,24 @@ if ! sudo -u ec2-user git -C "$H/ArchUnitGo" rev-parse --abbrev-ref HEAD | grep 
 fi
 
 # The queue is "open issues, minus landed, minus skipped", and nothing is closed because the batch runs
-# NO_PUSH. Two corrections to make before that arithmetic gives the right answer:
+# NO_PUSH. Three corrections to make before that arithmetic gives the right answer:
 #
 #   30 and 31 must stay skipped. They are being re-attempted on the other host, against the same base;
 #   both hosts implementing them would produce two divergent versions of the same feature.
 for n in 30 31; do
+  grep -qx "$n" "$H/logs/skipped" || echo "$n" >> "$H/logs/skipped"
+done
+#   41, 42 and 44 must be held until the two hosts are merged. Splitting the backlog across hosts costs
+#   nothing on the issues that only touch their own feature — 35-37 are Metrics, 38-40 are cross-cutting
+#   but name no feature, so at worst they conflict in the merge. These three are different in kind: each
+#   describes or ships the library *as a whole*, and this host's tree has no Slices in it. #41 asks for
+#   "one example per module" and would silently omit a module; #42 builds the site from it; #44 tags a
+#   release of a tree that is missing a feature. All three would have to be redone after the merge, so
+#   running them now buys nothing and costs a plausible-looking wrong answer.
+#
+#   This was applied by hand before launch on the night, not by this script — recorded here because the
+#   queue is what makes these scripts worth keeping. `logs/HELD.txt` says the same thing on the host.
+for n in 41 42 44; do
   grep -qx "$n" "$H/logs/skipped" || echo "$n" >> "$H/logs/skipped"
 done
 #   34 must not be skipped, if the first batch abandoned it. It was abandoned under the old limits, and
