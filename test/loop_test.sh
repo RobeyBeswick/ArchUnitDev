@@ -664,6 +664,75 @@ GO
   want_grep "reporting only" "$ROOT/gate.out" "and says which constants it looked at"
 }
 
+# The gate's "at least one test exists" check, which on 15 August fired against a tree holding 117
+# test files at 100% coverage and abandoned four issues — #31, #35, #36, #37, ten fix rounds each,
+# about $80 — because nothing an implementer could write would ever satisfy it.
+#
+# It was written as `! find . -name '*_test.go' | grep -q .`. `grep -q` exits on its first match and
+# closes the pipe; `find` dies of SIGPIPE with 141; `set -o pipefail` reports 141 for the pipeline, and
+# `!` turns a successful match into a violation. It is a race the writer has to lose, so it passed for
+# months on a small tree and then failed permanently once the repo was big enough for find to still be
+# walking when grep left.
+#
+# Two things are checked here. The behaviour, in both directions, because a guard that cannot fail is
+# as bad as one that always does. And the *shape*: `| grep -q` is banned outright in the harness,
+# because the bug is invisible at the call site and the next person to write that line will not know.
+scenario_test_files_guard() {
+  setup
+
+  # A `go` that succeeds at everything, so the go.mod branch of the gate can be reached at all. The
+  # fixture deliberately has no go.mod precisely to skip this branch, and this is the one scenario
+  # that needs it — the check under test is guarded by `[ -f go.mod ]`.
+  cat > "$STUB_DIR/go" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$STUB_DIR/go"
+  gate_with_go() {
+    ( cd "$REPO" && PATH="$STUB_DIR:$PATH" env REPO="$REPO" BASE="$1" LOGS="$LOGS" \
+        bash "$HARNESS/gate.sh" ) > "$ROOT/gate.out" 2>&1
+    RC=$?
+  }
+
+  printf 'module example.invalid/m\n\ngo 1.23\n' > "$REPO/go.mod"
+
+  # Enough directories that find is still walking when a `grep -q` would leave: the original bug is a
+  # race, and one test file in the root would win it and hide the defect.
+  local i
+  for i in $(seq 1 300); do
+    mkdir -p "$REPO/pkg$i"
+    printf 'package pkg%s\n' "$i" > "$REPO/pkg$i/a.go"
+    printf 'package pkg%s\n\nfunc TestA(t *testing.T) {}\n' "$i" > "$REPO/pkg$i/a_test.go"
+  done
+  git -C "$REPO" add -A && git -C "$REPO" commit -q -m "a module with tests in it"
+
+  gate_with_go "$(git -C "$REPO" rev-parse HEAD)"
+  want_no_grep "no test files at all" "$ROOT/gate.out" \
+            "a tree full of test files does not report having none"
+
+  # ...and the check still does its job, which is the half that a naive fix would quietly remove.
+  find "$REPO" -name '*_test.go' -delete
+  git -C "$REPO" add -A && git -C "$REPO" commit -q -m "delete every test"
+  gate_with_go "$(git -C "$REPO" rev-parse HEAD)"
+  [ "$RC" != 0 ]; want $? "a module with no test files at all still fails the gate"
+  want_grep "VIOLATION: the module has no test files at all" "$ROOT/gate.out" \
+            "and says so"
+
+  # The shape, not just this instance. `cmd | grep -q` under pipefail is wrong in every case where the
+  # writer can outlive the match, and both sites that had it were silent failures in opposite
+  # directions: this check inverted, and looks_like_network_trouble reporting an outage as a defect.
+  # Code lines only — the comments explaining the ban name the banned shape, and a guard that trips on
+  # its own rationale teaches the next person to delete the rationale.
+  local offenders
+  offenders=$(grep -n '| *grep -q' "$HARNESS/gate.sh" "$HARNESS/run.sh" "$HARNESS/retro.sh" 2>/dev/null \
+              | grep -vE ':[[:space:]]*#')
+  if [ -z "$offenders" ]; then
+    ok "no 'cmd | grep -q' pipeline in the harness — pipefail reports the writer's SIGPIPE, not the match"
+  else
+    bad "a 'cmd | grep -q' pipeline is back: $offenders"
+  fi
+}
+
 # The two silent-defeat guards in preflight: a Go repo whose lint enforcement is not actually there.
 # A green gate that checks less than it claims is the worst outcome an overnight run can have, so
 # both of these must be fatal before any work starts, not warnings.
@@ -904,7 +973,7 @@ scenario_carry_default_off() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
+ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning test_files_guard pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then
