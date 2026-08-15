@@ -45,6 +45,19 @@ MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-400000}"
 NO_PUSH="${NO_PUSH:-}"              # set to 1 to commit locally but not push or close issues
 MAX_CONSECUTIVE_ABANDONS="${MAX_CONSECUTIVE_ABANDONS:-2}"   # stop the run after this many in a row; 0 = never stop
 RETRY_ABANDONED="${RETRY_ABANDONED-1}"    # re-attempt abandoned issues once the batch has grown under them; empty = off
+# Carry a *previous* run's outstanding findings into a first attempt, the way the retry phase carries
+# them into a second one. Off by default, because LOGS is long-lived: verdicts for an issue outlive the
+# run that wrote them, and telling a fresh implementer about a parked attempt that is not on this host
+# is a lie about what it is looking at.
+#
+# It exists because the retry phase is not always reachable. An issue abandoned by a run that then hit
+# its spend cap, tripped the consecutive-abandon breaker, or was simply stopped never gets the
+# re-attempt that would have carried its findings — and neither does one handed to a *different* host
+# to work through in parallel. Both are the same situation: the evidence is on disk, the abandonment
+# that would have queued it is not going to happen, and re-deriving it costs what it cost the first
+# time. Set this when you have deliberately put an abandoned issue's verdicts where this run can read
+# them.
+CARRY_FINDINGS="${CARRY_FINDINGS:-}"
 MAX_SPEND="${MAX_SPEND:-0}"         # dollars this run may spend before it stops at an issue boundary; 0 = no cap
 DOUBLE_CRITICS="${DOUBLE_CRITICS-tests}"  # roles that run twice in round 1, findings unioned; empty = none
 
@@ -478,7 +491,7 @@ while :; do
   # worklist they cost nothing to honour.
   carry="$LOGS/$TAG-carryover.md"
   rm -f "$carry"
-  if [ "$attempt" -gt 1 ]; then
+  if [ "$attempt" -gt 1 ] || [ -n "$CARRY_FINDINGS" ]; then
     # The last round that found anything, counting down: the final round of an abandoned issue is
     # sometimes a gate failure with no verdicts at all, and the round before it is then the one
     # holding the reasons.

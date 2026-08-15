@@ -848,9 +848,63 @@ scenario_retro() {
   fi
 }
 
+# The carry-over without the abandonment that queues it. The retry phase is only reachable when the
+# main pass ends by draining its queue or filling MAX_ISSUES: a run that hits its spend cap, trips the
+# consecutive-abandon breaker or is stopped by hand leaves its abandoned issues with no re-attempt at
+# all — and so does handing one to a second host to work through in parallel. In every one of those the
+# findings that say why the attempt failed are sitting in LOGS and the re-attempt is, mechanically, a
+# first attempt. CARRY_FINDINGS is what stops that evidence being re-derived at full price.
+scenario_carry_across_runs() {
+  setup
+
+  # A previous run, which abandons the issue and leaves its verdicts behind.
+  run_loop always_fail MAX_ISSUES=1
+  want_grep "#2 ABANDONED" "$ROOT/run.out" "the first run abandoned the issue"
+  # Both runs use the same TAG, so the first run's artifacts have to be copied aside before the second
+  # overwrites them — which is the assertion below: attempt one had nothing to carry.
+  cp "$STUB_DIR/2-implement.stdin" "$ROOT/first-implement.stdin"
+  want_no_grep "Outstanding findings from an earlier attempt" "$ROOT/first-implement.stdin" \
+            "and its own implementer had nothing to carry"
+
+  # What an operator does to hand the issue back to the loop: clear the entry that says it needs a
+  # human. On another host this is the same step, after the verdicts are copied across.
+  : > "$LOGS/skipped"
+  run_loop happy MAX_ISSUES=1 CARRY_FINDINGS=1
+
+  want "$RC" "the second run exits cleanly"
+  want_grep "#2 DONE" "$ROOT/run.out" "and lands the issue the first run gave up on"
+  want_grep "Outstanding findings from an earlier attempt" "$STUB_DIR/2-implement.stdin" \
+            "the fresh implementer is told an abandoned attempt exists"
+  want_grep "Still not right." "$STUB_DIR/2-implement.stdin" \
+            "with the findings that were outstanding when it was parked"
+  want_grep "you are not free to reproduce these" "$STUB_DIR/2-implement.stdin" \
+            "framed as constraints rather than as a worklist"
+  # One, not three: in this fixture the correctness critic is the only one still objecting in the round
+  # the attempt was parked on, and what is carried is what was outstanding — not every finding the
+  # attempt ever collected.
+  want_grep "carrying 1 outstanding finding(s)" "$ROOT/run.out" "and the carry-over is narrated"
+  want_grep "From the correctness reviewer" "$LOGS/2-carryover.md" \
+            "attributed to the critic that raised it, as the retry phase attributes it"
+}
+
+# Off by default, and the default is the whole safety of the thing: LOGS accumulates every batch ever
+# run into it, so an ordinary run must not prompt its implementer with an attempt it knows nothing
+# about and cannot see.
+scenario_carry_default_off() {
+  setup
+  run_loop always_fail MAX_ISSUES=1
+  : > "$LOGS/skipped"
+  run_loop happy MAX_ISSUES=1
+
+  want "$RC" "the run exits cleanly"
+  want_no_grep "Outstanding findings from an earlier attempt" "$STUB_DIR/2-implement.stdin" \
+            "no carry-over without CARRY_FINDINGS, even with an earlier attempt's verdicts on disk"
+  want_no_grep "carrying" "$ROOT/run.out" "and nothing is narrated"
+}
+
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry spend double_critic kind_pinning pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
+ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then
