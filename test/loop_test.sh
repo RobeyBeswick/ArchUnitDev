@@ -347,6 +347,56 @@ scenario_two_issues() {
 
 # A push that fails must not close the issue. This is the one path where the loop could report an
 # issue resolved with nothing on origin to show for it, so it stops the run instead.
+# git does not read GH_TOKEN; gh does. So every `gh` call in run.sh authenticated, the preflight
+# `gh auth status` passed, and `git push` could not have worked — it would have asked for a username,
+# found no terminal, and died with 128. Nothing caught it because every run so far set NO_PUSH=1, so
+# the first batch that actually intended to deliver would have aborted on its first landed issue.
+#
+# Measured in the real image with a valid token in the environment before this was written:
+# `gh auth status` ok, `git credential fill` fatal, `git push --dry-run` rc=128.
+#
+# Every run_loop here blanks the global and system git config. Without that, a maintainer with
+# osxkeychain or a manager-of-record helper configured for github.com would have git answer the
+# credential request from their own machine, and the negative case would pass for the wrong reason —
+# while quietly consulting their real GitHub credential to do it.
+scenario_push_credential() {
+  local HERMETIC=(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1)
+  setup
+  git -C "$REPO" remote set-url origin https://github.com/example/example.git
+
+  run_loop happy PREFLIGHT_ONLY=1 "${HERMETIC[@]}"
+  [ "$RC" -ne 0 ]; want $? "a run that intends to push is refused when git has no github.com credential"
+  want_grep "git cannot get a credential for github.com" "$ROOT/run.out" "and says what is wrong"
+  want_grep "gh reads GH_TOKEN and git does not" "$ROOT/run.out" "and names the distinction it turns on"
+
+  run_loop happy PREFLIGHT_ONLY=1 STUB_GH_CRED=stub-token "${HERMETIC[@]}"
+  want "$RC" "a credential helper that answers satisfies the check"
+  want_grep "everything checks out" "$ROOT/run.out" "and the rest of preflight still runs"
+
+  run_loop happy PREFLIGHT_ONLY=1 NO_PUSH=1 "${HERMETIC[@]}"
+  want "$RC" "a NO_PUSH run needs no push credential"
+
+  # A local remote is not github.com, and the helper is scoped to that host — checking there would
+  # fail for a reason it is not equipped to fix. Every other scenario in this file depends on this,
+  # which is why it is asserted rather than left as an accident of the fixture.
+  setup
+  run_loop happy PREFLIGHT_ONLY=1 "${HERMETIC[@]}"
+  want "$RC" "a non-github origin skips the check entirely"
+
+  # The check proves a credential is reachable; these prove the pushes actually reach for it. A
+  # preflight that passes while the push sites go unchanged is the bug with a green light on it.
+  [ "$(grep -acF 'git "${GIT_CRED[@]}" push' "$HARNESS/run.sh")" = 2 ]
+  want $? "both push sites pass the credential, not just the preflight"
+
+  # And that none of it is installed anywhere persistent. `git config --global` here would leave a
+  # credential helper in the ~/.gitconfig of anyone who ran the loop outside Docker, which the README
+  # documents as supported; `store` would write the PAT itself into a file every implementer can read.
+  want_no_grep 'config --global credential' "$HARNESS/run.sh" \
+            "the helper is not written into anyone's global git config"
+  want_no_grep 'credential.helper=store' "$HARNESS/run.sh" \
+            "and the token is never persisted to disk by a store helper"
+}
+
 scenario_pushfail() {
   setup
   git -C "$REPO" remote set-url origin "$ROOT/there-is-no-remote-here.git"
@@ -973,7 +1023,7 @@ scenario_carry_default_off() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning test_files_guard pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
+ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning test_files_guard push_credential pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then
