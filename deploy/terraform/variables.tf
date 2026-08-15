@@ -22,6 +22,31 @@ variable "instance_type" {
   default     = "t3.medium"
 }
 
+variable "retry_host" {
+  description = <<-EOT
+    Create a second host for re-attempting abandoned issues in parallel with the main loop.
+
+    It is off by default because it only earns its keep when there is something to re-attempt: the main
+    loop's own retry phase covers the ordinary case, and it is unreachable only when the run ends on
+    its spend cap, on the consecutive-abandon breaker, or by hand. Turning this on is the answer to
+    "these two issues need many more rounds than the batch is configured for, and I am not stopping the
+    batch to give them those rounds".
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "retry_instance_type" {
+  description = <<-EOT
+    Larger than the loop host by memory, not by CPU: the work is still almost entirely waiting on
+    Bedrock, but this host runs the same `go test -race` and golangci-lint gate against a diff that has
+    already proved big enough to time an implementer out — and an OOM-killed gate step is the one
+    failure that reads as a code defect and sends a fixer after nothing. t3.large is 2 vCPU / 8GB.
+  EOT
+  type        = string
+  default     = "t3.large"
+}
+
 variable "volume_size" {
   description = "GB. The image is ~1.5GB, plus the Docker build cache, the Go caches, the clones and the logs."
   type        = number

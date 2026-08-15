@@ -8,6 +8,16 @@ output "connect" {
   value       = "aws ssm start-session --region ${var.region} --target ${aws_instance.loop.id}"
 }
 
+output "retry_instance_id" {
+  description = "The re-attempt host, if retry_host is on. Empty otherwise."
+  value       = try(aws_instance.retry[0].id, "")
+}
+
+output "connect_retry" {
+  description = "Shell on the re-attempt host. Empty unless retry_host is on."
+  value       = try("aws ssm start-session --region ${var.region} --target ${aws_instance.retry[0].id}", "")
+}
+
 output "ecr_repository_url" {
   description = "Push the harness image here; the instance pulls it from inside the VPC."
   value       = aws_ecr_repository.harness.repository_url
