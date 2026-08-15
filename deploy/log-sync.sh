@@ -30,15 +30,22 @@ command -v aws >/dev/null || die "the aws CLI is not on PATH"
 
 DEST="${S3_LOGS%/}/$RUN_ID"
 
-# `latest` is excluded because it is a symlink to a path inside the container — run.sh points it at the
-# debug log of the invocation currently running, so it reads as `/work/logs/35-implement.debug.log`,
-# which does not exist out here. `aws s3 sync` skips a dangling symlink with a warning and *still exits
-# non-zero*, which turns the deliberately-fatal first sync below into a refusal to start: shipping logs
-# works right up until the moment a run is interrupted and restarted, and then it does not, for a
-# reason that has nothing to do with the destination or the role. It is also worthless in S3 — a
-# pointer to a filesystem nobody reading the bucket has.
+# --no-follow-symlinks, because run.sh keeps `logs/latest` pointed at the debug log of the invocation
+# currently running — and it points at the *container's* view of it, `/work/logs/35-implement.debug.log`.
+# Out here, where log-sync runs, that is a dangling symlink. `aws s3 sync` skips one with a warning and
+# still exits non-zero, so the deliberately-fatal first sync below turns into a refusal to start,
+# reported as "fix the destination or the instance role" when both are fine.
+#
+# It only bites on a restart: a fresh log directory has no `latest` yet, so the first sync succeeds and
+# every later one fails harmlessly into the warn-and-continue path. Restart shipping over a directory a
+# run has already used — which is what stopping a batch to re-run it with different limits means — and
+# the same condition is fatal.
+#
+# Not --exclude: the warning comes from the directory walk, before the filters are applied, so
+# excluding the path suppresses neither the message nor the exit status. Nothing in the log directory
+# needs a symlink followed, and a symlink into a container's filesystem is worthless in a bucket.
 sync_once() {
-  aws s3 sync "$LOGS" "$DEST" --only-show-errors --exclude latest
+  aws s3 sync "$LOGS" "$DEST" --only-show-errors --no-follow-symlinks
 }
 
 # A final sync on the way out, so stopping the run flushes the last few minutes rather than losing
