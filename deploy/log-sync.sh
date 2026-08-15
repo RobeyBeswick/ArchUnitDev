@@ -30,8 +30,15 @@ command -v aws >/dev/null || die "the aws CLI is not on PATH"
 
 DEST="${S3_LOGS%/}/$RUN_ID"
 
+# `latest` is excluded because it is a symlink to a path inside the container — run.sh points it at the
+# debug log of the invocation currently running, so it reads as `/work/logs/35-implement.debug.log`,
+# which does not exist out here. `aws s3 sync` skips a dangling symlink with a warning and *still exits
+# non-zero*, which turns the deliberately-fatal first sync below into a refusal to start: shipping logs
+# works right up until the moment a run is interrupted and restarted, and then it does not, for a
+# reason that has nothing to do with the destination or the role. It is also worthless in S3 — a
+# pointer to a filesystem nobody reading the bucket has.
 sync_once() {
-  aws s3 sync "$LOGS" "$DEST" --only-show-errors
+  aws s3 sync "$LOGS" "$DEST" --only-show-errors --exclude latest
 }
 
 # A final sync on the way out, so stopping the run flushes the last few minutes rather than losing
