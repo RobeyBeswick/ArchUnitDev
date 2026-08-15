@@ -212,6 +212,45 @@ gh auth status >/dev/null 2>&1 || die "gh is not authenticated (set GH_TOKEN)"
 git config user.email >/dev/null 2>&1 || die "git user.email is not configured in the container"
 git remote get-url origin >/dev/null 2>&1 || die "no git remote named origin"
 
+# git does not read GH_TOKEN. `gh` does, which is why every `gh` call in this file worked and the
+# `git push` at the end of a landed issue did not: with no credential helper configured, an HTTPS
+# push asks for a username, there is no terminal to ask, and it dies with 128. Measured in the image
+# with a valid token in the environment: `gh auth status` ok, `git credential fill` fatal, `git push
+# --dry-run` 128. It stayed hidden because every run so far set NO_PUSH=1 — the shape of bug that
+# waits for the run you most want to succeed, since the first pushing run would have aborted at its
+# first landed issue on the deliberate `else` that stops a batch when a push fails.
+#
+# `!gh auth git-credential` and not `store`: the helper shells out to gh, which reads the token from
+# its own environment each time, so nothing is written to disk. A `store` helper would leave the PAT
+# in ~/.git-credentials inside the container — a file every implementer can read, and whose absence
+# deploy/README.md documents as a property this design relies on.
+#
+# Passed per invocation rather than written with `git config`. `--global` would leave a credential
+# helper in the ~/.gitconfig of anyone who ran the loop outside Docker, which the README describes as
+# a supported way to run it, and `--local` would do the same to the target repository's .git/config.
+# Neither is ours to modify, and a flag at the call site is also where a reader will look for it.
+#
+# None of this weakens the `env -u GH_TOKEN` around model invocations. The helper is a way to *reach*
+# the token, not a copy of it: with GH_TOKEN stripped, gh cannot authenticate, the helper returns
+# nothing, and an implementer still cannot push.
+GIT_CRED=(-c 'credential.https://github.com.helper=!gh auth git-credential')
+
+# Proven at preflight, because the alternative is discovering it after an issue's worth of spend. Only
+# when this run intends to push, and only for a github.com origin — the helper is scoped to that host,
+# so anywhere else this check would fail for a reason it is not equipped to fix.
+#
+# A here-string, not `printf ... | git credential fill`: that pipeline is the exact shape that made
+# gate.sh report an empty test suite for a fortnight. See the comment on that fix.
+case "$(git remote get-url origin)" in
+  *github.com*)
+    if [ -z "$NO_PUSH" ]; then
+      GIT_TERMINAL_PROMPT=0 git "${GIT_CRED[@]}" credential fill \
+          <<<$'protocol=https\nhost=github.com\n' >/dev/null 2>&1 \
+        || die "git cannot get a credential for github.com, so every push this run makes would fail with 'could not read Username'. gh being authenticated is not the same thing: gh reads GH_TOKEN and git does not. Set NO_PUSH=1 to run without pushing."
+    fi
+    ;;
+esac
+
 # Prune the landed list of issues that are no longer open. An entry there means only "work exists for
 # this issue which the issue itself does not yet reflect", and a closed issue reflects it — so the
 # entry has served its purpose and keeping it is actively harmful. Reopening an issue is how a human
@@ -697,7 +736,7 @@ SWEEP
       say "#$N DONE"
       done_count=$((done_count + 1))
       consecutive_abandons=0
-    elif git push -q origin HEAD; then
+    elif git "${GIT_CRED[@]}" push -q origin HEAD; then
       # The commit message closes the issue by itself once it is on the default branch; this is the
       # belt to that braces, and it is also what leaves the review trail on the issue.
       say "#$N pushed as $landed_as"
@@ -730,7 +769,7 @@ SWEEP
       git commit -q -m "WIP #$N: $TITLE" \
         -m "Abandoned by the ArchUnitDev loop: ${abandon_reason:-no unanimous PASS}.${verdicts:+ Final round:$verdicts.} Needs a human."
       git branch -f "$branch" HEAD
-      [ -n "$NO_PUSH" ] || git push -q origin "$branch" || say "WARNING: could not push $branch"
+      [ -n "$NO_PUSH" ] || git "${GIT_CRED[@]}" push -q origin "$branch" || say "WARNING: could not push $branch"
       git reset -q --hard "$BASE"
       say "#$N work parked on branch $branch; $REPO reset to $(git rev-parse --short "$BASE")"
     fi
