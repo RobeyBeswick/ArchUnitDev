@@ -68,9 +68,15 @@ done
 #   34 must not be skipped, if the first batch abandoned it. It was abandoned under the old limits, and
 #   giving it the new ones is the entire point of restarting. Its verdicts stay on disk, so
 #   CARRY_FINDINGS below hands the previous attempt's findings to the new one.
+#   `|| true` and then a verification, not `&& mv`: `grep -vx 34` over a file whose only line is `34`
+#   prints nothing and exits 1, so `grep ... && mv` skips the mv and leaves the number skipped while
+#   still narrating success. It cost a three-second run with an empty queue when the relaunch script
+#   inherited this line. See deploy/runs/relaunch-after-gate-fix.sh.
 if grep -qx 34 "$H/logs/skipped"; then
-  grep -vx 34 "$H/logs/skipped" > "$H/logs/skipped.tmp" && mv "$H/logs/skipped.tmp" "$H/logs/skipped"
+  grep -vx 34 "$H/logs/skipped" > "$H/logs/skipped.tmp" || true
+  mv "$H/logs/skipped.tmp" "$H/logs/skipped"
   chown ec2-user:ec2-user "$H/logs/skipped"
+  grep -qx 34 "$H/logs/skipped" && { say "REFUSING: could not un-skip #34"; exit 1; }
   say "#34 was abandoned by the first batch — removed from skipped so it is re-attempted with the new limits"
 fi
 say "skipped: $(tr '\n' ' ' < "$H/logs/skipped")"

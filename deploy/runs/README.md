@@ -65,6 +65,49 @@ These three describe or ship the library *as a whole*, against a tree with no Sl
 for "one example per module" and would omit one, `#42` builds the site from that README, `#44` tags a
 release of an incomplete tree. Work that has to be redone is worse than work not yet done.
 
+### The gate bug that made all of this look like a runway problem
+
+The wider limits were relaunched at 09:30 and by 11:32 host B had abandoned `#35`, `#36` and `#37` and
+tripped its abandon breaker; host A had abandoned `#31` at 10:14. Every one of them failed the same
+way: `gate failed` on all eleven rounds, with the gate log showing build, vet, lint, the whole suite
+and 100% coverage passing before
+
+```
+--- at least one test exists
+VIOLATION: the module has no test files at all.
+```
+
+The check was `! find . -name '*_test.go' | grep -q .`. `grep -q` exits on its first match and closes
+the pipe, `find` dies of SIGPIPE with 141, `set -o pipefail` makes 141 the pipeline's status, and the
+`!` turns a *successful* match into a violation. Measured in the container on the real tree: 117 test
+files, pipeline exit 141. Nothing an implementer could write would ever satisfy it.
+
+It is a race the writer has to lose, which is why it passed for months and then failed permanently: on
+a small tree `find` finishes inside the pipe buffer and exits 0. `looks_like_network_trouble` had the
+same shape with the defect pointing the other way — a long enough failure log outlasts the buffer, so
+a network outage would have been reported to the fixer as a code defect.
+
+Three things this cost, and one it did not:
+
+- Four issues and about $80, ten fix rounds each, across two hosts.
+- A retrospective that blamed the runway, because nobody read the gate log past the passing tests. The
+  `#26` and 14 August retros both did the same thing. **A gate failure that repeats identically across
+  rounds is a gate bug until proven otherwise** — a fixer that cannot move the needle in ten tries is
+  not failing to fix, it is being told something untrue.
+- The 14 August batch's `#30`/`#31` abandonment, which was read as a timeout problem, and partly was:
+  `#30` really did need 7 rounds. But `#31` was almost certainly this.
+
+What it did not cost: the rest of the backlog. `MAX_CONSECUTIVE_ABANDONS=3` stopped host B at `#37`
+rather than letting it burn `#38`, `#39`, `#40` and `#43` identically, and the message it printed named
+the right suspect — "far more often a broken environment ... than several independently hard issues".
+The tripwire was the only part of the system that diagnosed this correctly.
+
+The parked work turned out to be intact. `abandoned/issue-35`, `-36` and `-37` all pass the fixed gate
+with zero violations, which is the confirmation that the implementations were complete and only the
+check was wrong. They were re-run from scratch anyway rather than salvaged: resuming from a parked
+branch is a harness feature that does not exist, and inventing one while two hosts sat idle was the
+worse trade when the re-run is $80 and cost is not the constraint.
+
 ### What the wider limits bought
 
 `#30` landed on the first attempt under them: 7 rounds, all three critics passing, $26. Six of those
