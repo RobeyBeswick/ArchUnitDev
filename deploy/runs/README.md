@@ -59,6 +59,18 @@ The abandon tripwire is on for B and off for A, and the asymmetry is the point: 
 issues that have *already* been abandoned once, so the tripwire would fire on the expected outcome
 rather than on a broken environment.
 
+`#41`, `#42` and `#44` are held off B's queue until the two trees are merged. The rest of the split
+costs only a merge — `#35`-`#37` are Metrics, and `#38`-`#40` are cross-cutting but name no feature.
+These three describe or ship the library *as a whole*, against a tree with no Slices in it: `#41` asks
+for "one example per module" and would omit one, `#42` builds the site from that README, `#44` tags a
+release of an incomplete tree. Work that has to be redone is worse than work not yet done.
+
+### What the wider limits bought
+
+`#30` landed on the first attempt under them: 7 rounds, all three critics passing, $26. Six of those
+rounds went to the gate before the diff was even reviewable — under the old `MAX_ROUNDS=4` it would
+have been abandoned a second time, at roughly the same cost. The runway was the whole problem.
+
 ### Getting the work between hosts
 
 The batch runs `NO_PUSH=1`, so its commits exist only on the volume that made them. The transport is a
@@ -78,3 +90,9 @@ keeping. See the comment on `aws_iam_role_policy.handoff`.
   directory first, and log-sync ships that. Both scripts here upload to `handoff/` instead.
 - `run.sh` contains a NUL byte (inside a jq `unique_by(.file + "\x00" + .problem)`), which makes plain
   `grep` treat it as binary and print nothing. Use `grep -a`.
+- Restarting a batch over a log directory a previous run used made log-sync refuse to start, and so
+  refuse to launch: `logs/latest` is a symlink to the *container's* path for the current debug log, and
+  `aws s3 sync` skips a dangling symlink with a warning but still exits 2. `--exclude` does not help —
+  the warning comes from the directory walk, before filters apply. Fixed with `--no-follow-symlinks`
+  (exit 2 → 0, measured on the host). A fresh host never sees it: with no `latest` yet the fatal first
+  sync succeeds, and every later failure lands in the warn-and-continue path.
