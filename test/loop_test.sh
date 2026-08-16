@@ -347,6 +347,50 @@ scenario_two_issues() {
 
 # A push that fails must not close the issue. This is the one path where the loop could report an
 # issue resolved with nothing on origin to show for it, so it stops the run instead.
+# The end-of-run count, against a skipped list that is not all this run's fault. LOGS is deliberately
+# long-lived, so the list holds every abandonment any earlier batch recorded, and operators put numbers
+# there by hand to hold an issue back — both of which the summary used to report as tonight's failures.
+#
+# Not hypothetical: host B landed all seven of its issues on 15 August 2026 and announced "7 issue(s)
+# landed, 5 abandoned", the five being two issues handed to a second host and three held until a merge.
+# The retrospective is handed these numbers, and this week already cost two retros that reasoned
+# confidently from a figure nobody had checked.
+scenario_abandon_count() {
+  setup
+  # One issue this run will abandon, one held back by hand, and one left over from an earlier batch
+  # that no longer appears in the queue at all.
+  printf '2\n3\n' > "$STUB_DIR/open-issues"
+  printf '3\n99\n' > "$LOGS/skipped"
+
+  run_loop always_fail MAX_CONSECUTIVE_ABANDONS=0
+
+  want_grep "run finished: 0 issue(s) landed, 1 abandoned" "$ROOT/run.out" \
+            "only the issue this run abandoned is counted as abandoned"
+  want_grep "2 further issue(s)" "$ROOT/run.out" "the rest are reported separately"
+  want_grep "held back by hand: 3 99" "$ROOT/run.out" "and named, so an operator can see whose they are"
+  want_no_grep "0 issue(s) landed, 3 abandoned" "$ROOT/run.out" \
+            "the whole skipped list is not reported as this run's failures"
+
+  # The other direction: nothing extra in the list, so no second line to explain away. A run that
+  # abandoned everything it touched must still say so plainly.
+  setup
+  printf '2\n3\n' > "$STUB_DIR/open-issues"
+  run_loop always_fail MAX_CONSECUTIVE_ABANDONS=0
+  want_grep "run finished: 0 issue(s) landed, 2 abandoned" "$ROOT/run.out" \
+            "a run that abandoned both of its issues reports both"
+  want_no_grep "further issue(s)" "$ROOT/run.out" "and adds no line about issues that are not there"
+
+  # And a clean run over a polluted list: the count that matters most, because this is the one that
+  # reads as a failure when it is a success.
+  setup
+  printf '2\n' > "$STUB_DIR/open-issues"
+  printf '41\n42\n44\n' > "$LOGS/skipped"
+  run_loop happy
+  want_grep "run finished: 1 issue(s) landed, 0 abandoned" "$ROOT/run.out" \
+            "a run that abandoned nothing reports nothing abandoned, however full the list is"
+  want_grep "held back by hand: 41 42 44" "$ROOT/run.out" "while still accounting for the held issues"
+}
+
 # git does not read GH_TOKEN; gh does. So every `gh` call in run.sh authenticated, the preflight
 # `gh auth status` passed, and `git push` could not have worked — it would have asked for a username,
 # found no terminal, and died with 128. Nothing caught it because every run so far set NO_PUSH=1, so
@@ -1023,7 +1067,7 @@ scenario_carry_default_off() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning test_files_guard push_credential pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
+ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning test_files_guard push_credential abandon_count pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then

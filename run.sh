@@ -82,6 +82,48 @@ forget_skipped() {
   awk -v n="$1" '$0 != n' "$SKIPPED" > "$SKIPPED.tmp" && mv "$SKIPPED.tmp" "$SKIPPED"
 }
 
+# How many issues *this* run abandoned and did not recover, and how many entries in the skipped list
+# are somebody else's business. The end-of-run summary used to report `wc -l < $SKIPPED` as "abandoned",
+# which is wrong in both directions the moment LOGS outlives a single batch — and LOGS is deliberately
+# long-lived. It counted every abandonment any earlier batch ever recorded, and it counted issues an
+# operator had put there by hand to hold them back.
+#
+# It said what it said out loud, too: host B landed all seven of its issues on 15 August and reported
+# "7 issue(s) landed, 5 abandoned", the five being #30 and #31 (handed to a second host) and #41, #42
+# and #44 (held until the two trees were merged). The same batch's retrospective then had to reason
+# about a five-failure night that had not happened. That is the expensive part — this week already cost
+# two retrospectives that drew confident conclusions from a number nobody had checked.
+#
+# The narrowing is an intersection with the issues this run touched, which the loop already tracks for
+# the retrospective. `attempt > 1` landings call forget_skipped, so an issue abandoned in the main pass
+# and recovered by the retry phase is correctly absent from both.
+#
+# The bash 3.2 +expansion guard, as everywhere else here: "${arr[@]}" on an empty array is an unbound
+# variable under `set -u`, and a run that abandoned nothing has exactly that.
+abandoned_this_run() {
+  local n c=0
+  for n in ${attempted_issues[@]+"${attempted_issues[@]}"}; do
+    grep -qx "$n" "$SKIPPED" 2>/dev/null && c=$((c + 1))
+  done
+  printf '%s' "$c"
+}
+other_skipped_list() {
+  local n out=""
+  while read -r n; do
+    [ -n "$n" ] || continue
+    case " ${attempted_issues[*]-} " in *" $n "*) continue ;; esac
+    out="${out:+$out }$n"
+  done < "$SKIPPED"
+  printf '%s' "$out"
+}
+other_skipped() {
+  local l
+  l=$(other_skipped_list)
+  # Word count on the list, not a line count on the file: this must agree with what the list prints.
+  set -- $l
+  printf '%s' "$#"
+}
+
 # What this run has cost so far, in dollars, from the only authority on it: the total_cost_usd every
 # invocation writes into its own result JSON.
 #
@@ -802,7 +844,13 @@ SWEEP
   esac
 done
 
-say "run finished: $done_count issue(s) landed, $(wc -l < "$SKIPPED" | tr -d ' ') abandoned"
+say "run finished: $done_count issue(s) landed, $(abandoned_this_run) abandoned"
+# What is in the skipped list but was not this run's doing. Worth a line of its own rather than being
+# folded into the count above: it is the difference between "this batch failed five times" and "five
+# issues are waiting for a reason that has nothing to do with tonight".
+if [ "$(other_skipped)" -gt 0 ]; then
+  say "  ($(other_skipped) further issue(s) in $(basename "$SKIPPED") from earlier batches or held back by hand: $(other_skipped_list))"
+fi
 [ "$retried" -gt 0 ] && say "re-attempted $retried abandoned issue(s) on the batch's final tree: $retry_landed landed, $((retried - retry_landed)) still need a human"
 # This run's spend, and the log directory's, separately. They differ whenever LOGS has been used
 # before, which is the normal case here — and the single glob total used to be reported as "total
