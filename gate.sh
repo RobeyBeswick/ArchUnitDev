@@ -20,8 +20,15 @@ step() { printf '\n--- %s\n' "$*"; }
 # Some checks need the network (the module proxy, the vulnerability database). A network failure is
 # not a code defect, and failing the gate for one would send the fixer off to repair something it
 # cannot reach. Warn and carry on instead.
+#
+# A here-string rather than `printf | grep -q`, for the reason documented on the "at least one test
+# exists" check below: `grep -q` closes the pipe on its first match, the writer dies of SIGPIPE, and
+# `set -o pipefail` reports 141 for a pipeline whose grep *succeeded*. Here that inverts the answer on
+# exactly the inputs the function exists for — a long enough failure log to outlast the pipe buffer,
+# which is the case where the network really is broken — and a network outage would then be reported to
+# the fixer as a code defect.
 looks_like_network_trouble() {
-  printf '%s' "$1" | grep -qiE 'dial tcp|no such host|i/o timeout|lookup .* on |connection refused|proxy.golang.org|TLS handshake|certificate'
+  grep -qiE 'dial tcp|no such host|i/o timeout|lookup .* on |connection refused|proxy.golang.org|TLS handshake|certificate' <<<"$1"
 }
 
 if [ -f go.mod ]; then
@@ -233,7 +240,20 @@ else
 fi
 
 step "at least one test exists"
-if [ -f go.mod ] && ! find . -name '*_test.go' -not -path './.git/*' | grep -q .; then
+# `-print -quit` rather than `find ... | grep -q .`, and the difference is not stylistic: `grep -q`
+# exits on its first match and closes the pipe, `find` then dies of SIGPIPE with 141, and `set -o
+# pipefail` makes that the pipeline's status. The `!` turns a *successful* match into a violation, so
+# this check reported "no test files at all" against a tree holding 117 of them and passing at 100%
+# coverage — and it did so unconditionally, on every round of every issue, because nothing the fixer
+# could write would change it.
+#
+# It cost four issues and roughly $80 across two hosts on 15 August (#31, #35, #36, #37, ten fix
+# rounds each), and the reason it went unnoticed for so long is that it is a race the writer has to
+# lose: with few enough test files `find` finishes inside the 64KiB pipe buffer and exits 0. The repo
+# grew past that. A check that cannot fail on a small fixture and always fails on a real tree is the
+# worst possible arrangement, so `-print -quit` removes the pipe rather than the symptom: find stops
+# at the first hit, exits 0, and the substitution is empty exactly when there are no test files.
+if [ -f go.mod ] && [ -z "$(find . -name '*_test.go' -not -path './.git/*' -print -quit)" ]; then
   printf 'VIOLATION: the module has no test files at all.\n'
   fail=1
 fi

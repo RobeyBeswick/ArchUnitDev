@@ -12,14 +12,56 @@ variable "name" {
 
 variable "instance_type" {
   description = <<-EOT
-    2 vCPU is plenty — the loop is almost entirely waiting on the Bedrock API. Memory is the one
-    dimension that is not padding: the gate runs `go test -race`, which costs 5-10x the memory of a
-    plain test binary, on top of golangci-lint type-checking the whole package graph. 1GB is not
-    enough, and the failure mode is the OOM killer taking out a gate step, which reads in the log as
-    a code defect and sends the fixer after something that is not there. t3.medium is 2 vCPU / 4GB.
+    The loop is almost entirely waiting on the Bedrock API, so CPU count is not what decides this.
+    Memory is: the gate runs `go test -race`, which costs 5-10x the memory of a plain test binary, on
+    top of golangci-lint type-checking the whole package graph. The failure mode is the OOM killer
+    taking out a gate step, which reads in the log as a code defect and sends the fixer after
+    something that is not there — an hour of spend on a bug that does not exist.
+
+    m5.xlarge (4 vCPU / 16GiB) rather than the t3.medium this started on. t3.medium's 4GB is the
+    *floor* for the gate rather than comfortable headroom, and a burstable instance puts the CPU
+    credit balance in the path of the one sustained-CPU part of the run. See var.retry_instance_type
+    for the longer version of both arguments.
+
+    Changing this on an existing host is an in-place update that STOPS AND STARTS the instance.
+    Under NO_PUSH the volume holds commits that exist nowhere else, and stopping mid-run kills the
+    container along with the issue it was part-way through. Apply a resize between batches, never
+    during one, and read the plan before saying yes.
   EOT
   type        = string
-  default     = "t3.medium"
+  default     = "m5.xlarge"
+}
+
+variable "retry_host" {
+  description = <<-EOT
+    Create a second host for re-attempting abandoned issues in parallel with the main loop.
+
+    It is off by default because it only earns its keep when there is something to re-attempt: the main
+    loop's own retry phase covers the ordinary case, and it is unreachable only when the run ends on
+    its spend cap, on the consecutive-abandon breaker, or by hand. Turning this on is the answer to
+    "these two issues need many more rounds than the batch is configured for, and I am not stopping the
+    batch to give them those rounds".
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "retry_instance_type" {
+  description = <<-EOT
+    Sized so that the host is never the reason a re-attempt fails. This host runs the same
+    `go test -race` and golangci-lint gate as the loop host, but against a diff that has already
+    proved big enough to time an implementer out, and for up to 11 rounds instead of 5 — and an
+    OOM-killed gate step is the one failure that reads in the log as a code defect and sends a fixer
+    after something that is not there. m5.xlarge is 4 vCPU / 16GiB.
+
+    m5 rather than t3.xlarge at the same size: t3 is burstable, and the gate is precisely the
+    sustained-CPU part of the run. Depleted CPU credits would show up as a gate step that takes
+    minutes longer each round until it trips the step timeout — a failure that looks like a slow test
+    suite and is actually the instance being throttled. Fixed performance costs ~15% more per hour and
+    removes the whole failure mode.
+  EOT
+  type        = string
+  default     = "m5.xlarge"
 }
 
 variable "volume_size" {
