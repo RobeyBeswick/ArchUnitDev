@@ -347,6 +347,100 @@ scenario_two_issues() {
 
 # A push that fails must not close the issue. This is the one path where the loop could report an
 # issue resolved with nothing on origin to show for it, so it stops the run instead.
+# The end-of-run count, against a skipped list that is not all this run's fault. LOGS is deliberately
+# long-lived, so the list holds every abandonment any earlier batch recorded, and operators put numbers
+# there by hand to hold an issue back — both of which the summary used to report as tonight's failures.
+#
+# Not hypothetical: host B landed all seven of its issues on 15 August 2026 and announced "7 issue(s)
+# landed, 5 abandoned", the five being two issues handed to a second host and three held until a merge.
+# The retrospective is handed these numbers, and this week already cost two retros that reasoned
+# confidently from a figure nobody had checked.
+scenario_abandon_count() {
+  setup
+  # One issue this run will abandon, one held back by hand, and one left over from an earlier batch
+  # that no longer appears in the queue at all.
+  printf '2\n3\n' > "$STUB_DIR/open-issues"
+  printf '3\n99\n' > "$LOGS/skipped"
+
+  run_loop always_fail MAX_CONSECUTIVE_ABANDONS=0
+
+  want_grep "run finished: 0 issue(s) landed, 1 abandoned" "$ROOT/run.out" \
+            "only the issue this run abandoned is counted as abandoned"
+  want_grep "2 further issue(s)" "$ROOT/run.out" "the rest are reported separately"
+  want_grep "held back by hand: 3 99" "$ROOT/run.out" "and named, so an operator can see whose they are"
+  want_no_grep "0 issue(s) landed, 3 abandoned" "$ROOT/run.out" \
+            "the whole skipped list is not reported as this run's failures"
+
+  # The other direction: nothing extra in the list, so no second line to explain away. A run that
+  # abandoned everything it touched must still say so plainly.
+  setup
+  printf '2\n3\n' > "$STUB_DIR/open-issues"
+  run_loop always_fail MAX_CONSECUTIVE_ABANDONS=0
+  want_grep "run finished: 0 issue(s) landed, 2 abandoned" "$ROOT/run.out" \
+            "a run that abandoned both of its issues reports both"
+  want_no_grep "further issue(s)" "$ROOT/run.out" "and adds no line about issues that are not there"
+
+  # And a clean run over a polluted list: the count that matters most, because this is the one that
+  # reads as a failure when it is a success.
+  setup
+  printf '2\n' > "$STUB_DIR/open-issues"
+  printf '41\n42\n44\n' > "$LOGS/skipped"
+  run_loop happy
+  want_grep "run finished: 1 issue(s) landed, 0 abandoned" "$ROOT/run.out" \
+            "a run that abandoned nothing reports nothing abandoned, however full the list is"
+  want_grep "held back by hand: 41 42 44" "$ROOT/run.out" "while still accounting for the held issues"
+}
+
+# git does not read GH_TOKEN; gh does. So every `gh` call in run.sh authenticated, the preflight
+# `gh auth status` passed, and `git push` could not have worked — it would have asked for a username,
+# found no terminal, and died with 128. Nothing caught it because every run so far set NO_PUSH=1, so
+# the first batch that actually intended to deliver would have aborted on its first landed issue.
+#
+# Measured in the real image with a valid token in the environment before this was written:
+# `gh auth status` ok, `git credential fill` fatal, `git push --dry-run` rc=128.
+#
+# Every run_loop here blanks the global and system git config. Without that, a maintainer with
+# osxkeychain or a manager-of-record helper configured for github.com would have git answer the
+# credential request from their own machine, and the negative case would pass for the wrong reason —
+# while quietly consulting their real GitHub credential to do it.
+scenario_push_credential() {
+  local HERMETIC=(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1)
+  setup
+  git -C "$REPO" remote set-url origin https://github.com/example/example.git
+
+  run_loop happy PREFLIGHT_ONLY=1 "${HERMETIC[@]}"
+  [ "$RC" -ne 0 ]; want $? "a run that intends to push is refused when git has no github.com credential"
+  want_grep "git cannot get a credential for github.com" "$ROOT/run.out" "and says what is wrong"
+  want_grep "gh reads GH_TOKEN and git does not" "$ROOT/run.out" "and names the distinction it turns on"
+
+  run_loop happy PREFLIGHT_ONLY=1 STUB_GH_CRED=stub-token "${HERMETIC[@]}"
+  want "$RC" "a credential helper that answers satisfies the check"
+  want_grep "everything checks out" "$ROOT/run.out" "and the rest of preflight still runs"
+
+  run_loop happy PREFLIGHT_ONLY=1 NO_PUSH=1 "${HERMETIC[@]}"
+  want "$RC" "a NO_PUSH run needs no push credential"
+
+  # A local remote is not github.com, and the helper is scoped to that host — checking there would
+  # fail for a reason it is not equipped to fix. Every other scenario in this file depends on this,
+  # which is why it is asserted rather than left as an accident of the fixture.
+  setup
+  run_loop happy PREFLIGHT_ONLY=1 "${HERMETIC[@]}"
+  want "$RC" "a non-github origin skips the check entirely"
+
+  # The check proves a credential is reachable; these prove the pushes actually reach for it. A
+  # preflight that passes while the push sites go unchanged is the bug with a green light on it.
+  [ "$(grep -acF 'git "${GIT_CRED[@]}" push' "$HARNESS/run.sh")" = 2 ]
+  want $? "both push sites pass the credential, not just the preflight"
+
+  # And that none of it is installed anywhere persistent. `git config --global` here would leave a
+  # credential helper in the ~/.gitconfig of anyone who ran the loop outside Docker, which the README
+  # documents as supported; `store` would write the PAT itself into a file every implementer can read.
+  want_no_grep 'config --global credential' "$HARNESS/run.sh" \
+            "the helper is not written into anyone's global git config"
+  want_no_grep 'credential.helper=store' "$HARNESS/run.sh" \
+            "and the token is never persisted to disk by a store helper"
+}
+
 scenario_pushfail() {
   setup
   git -C "$REPO" remote set-url origin "$ROOT/there-is-no-remote-here.git"
@@ -355,10 +449,53 @@ scenario_pushfail() {
   [ "$RC" -ne 0 ]; want $? "the run stops rather than carrying on"
   want_grep "push failed for #2" "$ROOT/run.out" "and says which issue"
   want_grep "the issue stays OPEN" "$ROOT/run.out" "and that the issue was not resolved"
+
+  # Why it failed, in git's words, in the file that gets shipped and read. The day #42 was refused for a
+  # missing `workflow` token scope the reason was in the container's stdout and nowhere in run.log, and
+  # no wording this message could have chosen would have guessed it.
+  want_grep "git said:" "$ROOT/run.out" "and quotes git's own reason"
+  want_grep "git said:" "$LOGS/run.log" "including in run.log, not only on stdout"
+  [ "$(grep -c 'push failed for #2' "$LOGS/run.log")" = 1 ]
+  want $? "as one grep-able line, not a multi-line entry"
+
   [ -f "$STUB_DIR/closed" ] && bad "the issue was closed with nothing on origin" \
                             || ok "the issue was NOT closed"
   [ "$(commits)" = 2 ]; want $? "the work is still committed locally, so nothing is lost"
   want_no_grep "DONE" "$ROOT/run.out" "the issue was not reported as done"
+}
+
+# A token that can reach github.com is not the same as a token allowed to do the job. GitHub refuses any
+# push that creates or updates a file under .github/workflows/ unless the token carries the `workflow`
+# scope, and it refuses it at the push — #42, the docs site, needs a Pages workflow, and was gated green
+# four rounds deep before being rejected at the end of two hours. So it is said at preflight instead.
+scenario_workflow_scope() {
+  local HERMETIC=(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1)
+  setup
+  git -C "$REPO" remote set-url origin https://github.com/example/example.git
+
+  run_loop happy PREFLIGHT_ONLY=1 STUB_GH_CRED=stub-token STUB_GH_SCOPES='gist,repo,workflow' "${HERMETIC[@]}"
+  want "$RC" "a token carrying the workflow scope passes preflight"
+  want_no_grep "no 'workflow' scope" "$ROOT/run.out" "and is not warned about"
+  want_no_grep "reports no OAuth scopes" "$ROOT/run.out" "nor mistaken for one that reports none"
+
+  run_loop happy PREFLIGHT_ONLY=1 STUB_GH_CRED=stub-token STUB_GH_SCOPES='gist,repo,read:org' "${HERMETIC[@]}"
+  want "$RC" "a token without it is warned about rather than refused — most issues never touch a workflow"
+  want_grep "no 'workflow' scope" "$ROOT/run.out" "and the warning names the scope"
+  want_grep "REFUSED at the push" "$ROOT/run.out" "and says where it would go wrong"
+
+  # A fine-grained PAT sends no scope header at all. Absent is unknown, not empty, and saying "no
+  # workflow scope" about a token that may well have the permission would train the reader to ignore it.
+  run_loop happy PREFLIGHT_ONLY=1 STUB_GH_CRED=stub-token "${HERMETIC[@]}"
+  want "$RC" "a token that reports no scopes is not refused either"
+  want_grep "reports no OAuth scopes" "$ROOT/run.out" "and is described as unknown rather than missing"
+  want_no_grep "no 'workflow' scope" "$ROOT/run.out" "not as definitely lacking the scope"
+
+  run_loop happy PREFLIGHT_ONLY=1 NO_PUSH=1 STUB_GH_SCOPES='gist,repo' "${HERMETIC[@]}"
+  want "$RC" "a NO_PUSH run still passes"
+  want_no_grep "no 'workflow' scope" "$ROOT/run.out" "and is not warned: it pushes nothing"
+
+  # The header the real API also sends, which the scope reader must not pick up instead.
+  want_no_grep "Accepted" "$ROOT/run.out" "X-Accepted-Oauth-Scopes is not mistaken for the scope list"
 }
 
 # Consecutive abandonments mean the environment broke, not that every issue is hard. The run must
@@ -664,6 +801,75 @@ GO
   want_grep "reporting only" "$ROOT/gate.out" "and says which constants it looked at"
 }
 
+# The gate's "at least one test exists" check, which on 15 August fired against a tree holding 117
+# test files at 100% coverage and abandoned four issues — #31, #35, #36, #37, ten fix rounds each,
+# about $80 — because nothing an implementer could write would ever satisfy it.
+#
+# It was written as `! find . -name '*_test.go' | grep -q .`. `grep -q` exits on its first match and
+# closes the pipe; `find` dies of SIGPIPE with 141; `set -o pipefail` reports 141 for the pipeline, and
+# `!` turns a successful match into a violation. It is a race the writer has to lose, so it passed for
+# months on a small tree and then failed permanently once the repo was big enough for find to still be
+# walking when grep left.
+#
+# Two things are checked here. The behaviour, in both directions, because a guard that cannot fail is
+# as bad as one that always does. And the *shape*: `| grep -q` is banned outright in the harness,
+# because the bug is invisible at the call site and the next person to write that line will not know.
+scenario_test_files_guard() {
+  setup
+
+  # A `go` that succeeds at everything, so the go.mod branch of the gate can be reached at all. The
+  # fixture deliberately has no go.mod precisely to skip this branch, and this is the one scenario
+  # that needs it — the check under test is guarded by `[ -f go.mod ]`.
+  cat > "$STUB_DIR/go" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$STUB_DIR/go"
+  gate_with_go() {
+    ( cd "$REPO" && PATH="$STUB_DIR:$PATH" env REPO="$REPO" BASE="$1" LOGS="$LOGS" \
+        bash "$HARNESS/gate.sh" ) > "$ROOT/gate.out" 2>&1
+    RC=$?
+  }
+
+  printf 'module example.invalid/m\n\ngo 1.23\n' > "$REPO/go.mod"
+
+  # Enough directories that find is still walking when a `grep -q` would leave: the original bug is a
+  # race, and one test file in the root would win it and hide the defect.
+  local i
+  for i in $(seq 1 300); do
+    mkdir -p "$REPO/pkg$i"
+    printf 'package pkg%s\n' "$i" > "$REPO/pkg$i/a.go"
+    printf 'package pkg%s\n\nfunc TestA(t *testing.T) {}\n' "$i" > "$REPO/pkg$i/a_test.go"
+  done
+  git -C "$REPO" add -A && git -C "$REPO" commit -q -m "a module with tests in it"
+
+  gate_with_go "$(git -C "$REPO" rev-parse HEAD)"
+  want_no_grep "no test files at all" "$ROOT/gate.out" \
+            "a tree full of test files does not report having none"
+
+  # ...and the check still does its job, which is the half that a naive fix would quietly remove.
+  find "$REPO" -name '*_test.go' -delete
+  git -C "$REPO" add -A && git -C "$REPO" commit -q -m "delete every test"
+  gate_with_go "$(git -C "$REPO" rev-parse HEAD)"
+  [ "$RC" != 0 ]; want $? "a module with no test files at all still fails the gate"
+  want_grep "VIOLATION: the module has no test files at all" "$ROOT/gate.out" \
+            "and says so"
+
+  # The shape, not just this instance. `cmd | grep -q` under pipefail is wrong in every case where the
+  # writer can outlive the match, and both sites that had it were silent failures in opposite
+  # directions: this check inverted, and looks_like_network_trouble reporting an outage as a defect.
+  # Code lines only — the comments explaining the ban name the banned shape, and a guard that trips on
+  # its own rationale teaches the next person to delete the rationale.
+  local offenders
+  offenders=$(grep -n '| *grep -q' "$HARNESS/gate.sh" "$HARNESS/run.sh" "$HARNESS/retro.sh" 2>/dev/null \
+              | grep -vE ':[[:space:]]*#')
+  if [ -z "$offenders" ]; then
+    ok "no 'cmd | grep -q' pipeline in the harness — pipefail reports the writer's SIGPIPE, not the match"
+  else
+    bad "a 'cmd | grep -q' pipeline is back: $offenders"
+  fi
+}
+
 # The two silent-defeat guards in preflight: a Go repo whose lint enforcement is not actually there.
 # A green gate that checks less than it claims is the worst outcome an overnight run can have, so
 # both of these must be fatal before any work starts, not warnings.
@@ -848,9 +1054,63 @@ scenario_retro() {
   fi
 }
 
+# The carry-over without the abandonment that queues it. The retry phase is only reachable when the
+# main pass ends by draining its queue or filling MAX_ISSUES: a run that hits its spend cap, trips the
+# consecutive-abandon breaker or is stopped by hand leaves its abandoned issues with no re-attempt at
+# all — and so does handing one to a second host to work through in parallel. In every one of those the
+# findings that say why the attempt failed are sitting in LOGS and the re-attempt is, mechanically, a
+# first attempt. CARRY_FINDINGS is what stops that evidence being re-derived at full price.
+scenario_carry_across_runs() {
+  setup
+
+  # A previous run, which abandons the issue and leaves its verdicts behind.
+  run_loop always_fail MAX_ISSUES=1
+  want_grep "#2 ABANDONED" "$ROOT/run.out" "the first run abandoned the issue"
+  # Both runs use the same TAG, so the first run's artifacts have to be copied aside before the second
+  # overwrites them — which is the assertion below: attempt one had nothing to carry.
+  cp "$STUB_DIR/2-implement.stdin" "$ROOT/first-implement.stdin"
+  want_no_grep "Outstanding findings from an earlier attempt" "$ROOT/first-implement.stdin" \
+            "and its own implementer had nothing to carry"
+
+  # What an operator does to hand the issue back to the loop: clear the entry that says it needs a
+  # human. On another host this is the same step, after the verdicts are copied across.
+  : > "$LOGS/skipped"
+  run_loop happy MAX_ISSUES=1 CARRY_FINDINGS=1
+
+  want "$RC" "the second run exits cleanly"
+  want_grep "#2 DONE" "$ROOT/run.out" "and lands the issue the first run gave up on"
+  want_grep "Outstanding findings from an earlier attempt" "$STUB_DIR/2-implement.stdin" \
+            "the fresh implementer is told an abandoned attempt exists"
+  want_grep "Still not right." "$STUB_DIR/2-implement.stdin" \
+            "with the findings that were outstanding when it was parked"
+  want_grep "you are not free to reproduce these" "$STUB_DIR/2-implement.stdin" \
+            "framed as constraints rather than as a worklist"
+  # One, not three: in this fixture the correctness critic is the only one still objecting in the round
+  # the attempt was parked on, and what is carried is what was outstanding — not every finding the
+  # attempt ever collected.
+  want_grep "carrying 1 outstanding finding(s)" "$ROOT/run.out" "and the carry-over is narrated"
+  want_grep "From the correctness reviewer" "$LOGS/2-carryover.md" \
+            "attributed to the critic that raised it, as the retry phase attributes it"
+}
+
+# Off by default, and the default is the whole safety of the thing: LOGS accumulates every batch ever
+# run into it, so an ordinary run must not prompt its implementer with an attempt it knows nothing
+# about and cannot see.
+scenario_carry_default_off() {
+  setup
+  run_loop always_fail MAX_ISSUES=1
+  : > "$LOGS/skipped"
+  run_loop happy MAX_ISSUES=1
+
+  want "$RC" "the run exits cleanly"
+  want_no_grep "Outstanding findings from an earlier attempt" "$STUB_DIR/2-implement.stdin" \
+            "no carry-over without CARRY_FINDINGS, even with an earlier attempt's verdicts on disk"
+  want_no_grep "carrying" "$ROOT/run.out" "and nothing is narrated"
+}
+
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry spend double_critic kind_pinning pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
+ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning test_files_guard push_credential workflow_scope abandon_count pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then

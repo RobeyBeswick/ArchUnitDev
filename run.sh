@@ -45,6 +45,19 @@ MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-400000}"
 NO_PUSH="${NO_PUSH:-}"              # set to 1 to commit locally but not push or close issues
 MAX_CONSECUTIVE_ABANDONS="${MAX_CONSECUTIVE_ABANDONS:-2}"   # stop the run after this many in a row; 0 = never stop
 RETRY_ABANDONED="${RETRY_ABANDONED-1}"    # re-attempt abandoned issues once the batch has grown under them; empty = off
+# Carry a *previous* run's outstanding findings into a first attempt, the way the retry phase carries
+# them into a second one. Off by default, because LOGS is long-lived: verdicts for an issue outlive the
+# run that wrote them, and telling a fresh implementer about a parked attempt that is not on this host
+# is a lie about what it is looking at.
+#
+# It exists because the retry phase is not always reachable. An issue abandoned by a run that then hit
+# its spend cap, tripped the consecutive-abandon breaker, or was simply stopped never gets the
+# re-attempt that would have carried its findings — and neither does one handed to a *different* host
+# to work through in parallel. Both are the same situation: the evidence is on disk, the abandonment
+# that would have queued it is not going to happen, and re-deriving it costs what it cost the first
+# time. Set this when you have deliberately put an abandoned issue's verdicts where this run can read
+# them.
+CARRY_FINDINGS="${CARRY_FINDINGS:-}"
 MAX_SPEND="${MAX_SPEND:-0}"         # dollars this run may spend before it stops at an issue boundary; 0 = no cap
 DOUBLE_CRITICS="${DOUBLE_CRITICS-tests}"  # roles that run twice in round 1, findings unioned; empty = none
 
@@ -67,6 +80,48 @@ record_skipped() { grep -qx "$1" "$SKIPPED" 2>/dev/null || echo "$1" >> "$SKIPPE
 forget_skipped() {
   grep -qx "$1" "$SKIPPED" 2>/dev/null || return 0
   awk -v n="$1" '$0 != n' "$SKIPPED" > "$SKIPPED.tmp" && mv "$SKIPPED.tmp" "$SKIPPED"
+}
+
+# How many issues *this* run abandoned and did not recover, and how many entries in the skipped list
+# are somebody else's business. The end-of-run summary used to report `wc -l < $SKIPPED` as "abandoned",
+# which is wrong in both directions the moment LOGS outlives a single batch — and LOGS is deliberately
+# long-lived. It counted every abandonment any earlier batch ever recorded, and it counted issues an
+# operator had put there by hand to hold them back.
+#
+# It said what it said out loud, too: host B landed all seven of its issues on 15 August and reported
+# "7 issue(s) landed, 5 abandoned", the five being #30 and #31 (handed to a second host) and #41, #42
+# and #44 (held until the two trees were merged). The same batch's retrospective then had to reason
+# about a five-failure night that had not happened. That is the expensive part — this week already cost
+# two retrospectives that drew confident conclusions from a number nobody had checked.
+#
+# The narrowing is an intersection with the issues this run touched, which the loop already tracks for
+# the retrospective. `attempt > 1` landings call forget_skipped, so an issue abandoned in the main pass
+# and recovered by the retry phase is correctly absent from both.
+#
+# The bash 3.2 +expansion guard, as everywhere else here: "${arr[@]}" on an empty array is an unbound
+# variable under `set -u`, and a run that abandoned nothing has exactly that.
+abandoned_this_run() {
+  local n c=0
+  for n in ${attempted_issues[@]+"${attempted_issues[@]}"}; do
+    grep -qx "$n" "$SKIPPED" 2>/dev/null && c=$((c + 1))
+  done
+  printf '%s' "$c"
+}
+other_skipped_list() {
+  local n out=""
+  while read -r n; do
+    [ -n "$n" ] || continue
+    case " ${attempted_issues[*]-} " in *" $n "*) continue ;; esac
+    out="${out:+$out }$n"
+  done < "$SKIPPED"
+  printf '%s' "$out"
+}
+other_skipped() {
+  local l
+  l=$(other_skipped_list)
+  # Word count on the list, not a line count on the file: this must agree with what the list prints.
+  set -- $l
+  printf '%s' "$#"
 }
 
 # What this run has cost so far, in dollars, from the only authority on it: the total_cost_usd every
@@ -198,6 +253,63 @@ cd "$REPO" || die "cannot cd to $REPO"
 gh auth status >/dev/null 2>&1 || die "gh is not authenticated (set GH_TOKEN)"
 git config user.email >/dev/null 2>&1 || die "git user.email is not configured in the container"
 git remote get-url origin >/dev/null 2>&1 || die "no git remote named origin"
+
+# git does not read GH_TOKEN. `gh` does, which is why every `gh` call in this file worked and the
+# `git push` at the end of a landed issue did not: with no credential helper configured, an HTTPS
+# push asks for a username, there is no terminal to ask, and it dies with 128. Measured in the image
+# with a valid token in the environment: `gh auth status` ok, `git credential fill` fatal, `git push
+# --dry-run` 128. It stayed hidden because every run so far set NO_PUSH=1 — the shape of bug that
+# waits for the run you most want to succeed, since the first pushing run would have aborted at its
+# first landed issue on the deliberate `else` that stops a batch when a push fails.
+#
+# `!gh auth git-credential` and not `store`: the helper shells out to gh, which reads the token from
+# its own environment each time, so nothing is written to disk. A `store` helper would leave the PAT
+# in ~/.git-credentials inside the container — a file every implementer can read, and whose absence
+# deploy/README.md documents as a property this design relies on.
+#
+# Passed per invocation rather than written with `git config`. `--global` would leave a credential
+# helper in the ~/.gitconfig of anyone who ran the loop outside Docker, which the README describes as
+# a supported way to run it, and `--local` would do the same to the target repository's .git/config.
+# Neither is ours to modify, and a flag at the call site is also where a reader will look for it.
+#
+# None of this weakens the `env -u GH_TOKEN` around model invocations. The helper is a way to *reach*
+# the token, not a copy of it: with GH_TOKEN stripped, gh cannot authenticate, the helper returns
+# nothing, and an implementer still cannot push.
+GIT_CRED=(-c 'credential.https://github.com.helper=!gh auth git-credential')
+
+# Proven at preflight, because the alternative is discovering it after an issue's worth of spend. Only
+# when this run intends to push, and only for a github.com origin — the helper is scoped to that host,
+# so anywhere else this check would fail for a reason it is not equipped to fix.
+#
+# A here-string, not `printf ... | git credential fill`: that pipeline is the exact shape that made
+# gate.sh report an empty test suite for a fortnight. See the comment on that fix.
+case "$(git remote get-url origin)" in
+  *github.com*)
+    if [ -z "$NO_PUSH" ]; then
+      GIT_TERMINAL_PROMPT=0 git "${GIT_CRED[@]}" credential fill \
+          <<<$'protocol=https\nhost=github.com\n' >/dev/null 2>&1 \
+        || die "git cannot get a credential for github.com, so every push this run makes would fail with 'could not read Username'. gh being authenticated is not the same thing: gh reads GH_TOKEN and git does not. Set NO_PUSH=1 to run without pushing."
+
+      # A reachable credential is not the same as one allowed to do the job. GitHub refuses a push that
+      # creates or updates anything under .github/workflows/ unless the token carries the `workflow`
+      # scope, and it refuses it *at the push* — after the implement, the gate and every critic have
+      # been paid for. #42 (the docs site, which has to add a Pages workflow) was gated green four
+      # rounds deep and then rejected for exactly this, at the end of two hours.
+      #
+      # Not a die(): the queue cannot know in advance which issue will touch a workflow file, and most
+      # do not, so refusing every run over a scope most runs never need would be worse than the miss.
+      # Said at preflight instead, where it is at the head of the log rather than buried at the end.
+      #
+      # X-OAuth-Scopes is sent for a classic token only. A fine-grained PAT lists no scopes at all, so
+      # an absent header means unknown rather than missing, and is worded that way.
+      case "$(gh api -i user 2>/dev/null | tr -d '\r' | sed -n 's/^[Xx]-[Oo][Aa]uth-[Ss]copes: *//p')" in
+        *workflow*) ;;
+        "") say "WARNING: the token reports no OAuth scopes, which is what a fine-grained PAT does — so whether it may write .github/workflows/ cannot be checked here. An issue that touches a workflow file may pass every check and still be refused at the push." ;;
+        *) say "WARNING: the token has no 'workflow' scope. Any issue that adds or edits a file under .github/workflows/ will pass the gate and every critic and then be REFUSED at the push, with the work committed locally and the issue left open. Add the scope before running such an issue." ;;
+      esac
+    fi
+    ;;
+esac
 
 # Prune the landed list of issues that are no longer open. An entry there means only "work exists for
 # this issue which the issue itself does not yet reflect", and a closed issue reflects it — so the
@@ -478,7 +590,7 @@ while :; do
   # worklist they cost nothing to honour.
   carry="$LOGS/$TAG-carryover.md"
   rm -f "$carry"
-  if [ "$attempt" -gt 1 ]; then
+  if [ "$attempt" -gt 1 ] || [ -n "$CARRY_FINDINGS" ]; then
     # The last round that found anything, counting down: the final round of an abandoned issue is
     # sometimes a gate failure with no verdicts at all, and the round before it is then the one
     # holding the reasons.
@@ -684,7 +796,7 @@ SWEEP
       say "#$N DONE"
       done_count=$((done_count + 1))
       consecutive_abandons=0
-    elif git push -q origin HEAD; then
+    elif push_err=$(git "${GIT_CRED[@]}" push -q origin HEAD 2>&1); then
       # The commit message closes the issue by itself once it is on the default branch; this is the
       # belt to that braces, and it is also what leaves the review trail on the issue.
       say "#$N pushed as $landed_as"
@@ -698,7 +810,11 @@ SWEEP
       # so the issue is not resolved and must not be closed. Stopping rather than carrying on: every
       # later push fails the same way, and a run that closes issues while nothing reaches origin is
       # the worst outcome available.
-      die "push failed for #$N — the commit is local only ($landed_as), so the issue stays OPEN. Nothing after this would reach origin either. Fix the remote and run again: the queue resumes from the issues still open."
+      # git's own words, or the reader has to go and find them. They were in the container's stdout and
+      # not in run.log the day #42 was refused for a missing `workflow` token scope, which is a reason
+      # nothing in this message could have guessed — and run.log is the file that gets shipped and read.
+      # Newlines collapsed because this file is scanned with grep, and a multi-line entry hides from it.
+      die "push failed for #$N — the commit is local only ($landed_as), so the issue stays OPEN. Nothing after this would reach origin either. Fix the remote and run again: the queue resumes from the issues still open. git said: $(printf '%s' "$push_err" | tr '\n' ' ')"
     fi
   else
     # Abandon: keep the work on a branch so nothing is lost, reset main, move on.
@@ -717,7 +833,7 @@ SWEEP
       git commit -q -m "WIP #$N: $TITLE" \
         -m "Abandoned by the ArchUnitDev loop: ${abandon_reason:-no unanimous PASS}.${verdicts:+ Final round:$verdicts.} Needs a human."
       git branch -f "$branch" HEAD
-      [ -n "$NO_PUSH" ] || git push -q origin "$branch" || say "WARNING: could not push $branch"
+      [ -n "$NO_PUSH" ] || git "${GIT_CRED[@]}" push -q origin "$branch" || say "WARNING: could not push $branch"
       git reset -q --hard "$BASE"
       say "#$N work parked on branch $branch; $REPO reset to $(git rev-parse --short "$BASE")"
     fi
@@ -750,7 +866,13 @@ SWEEP
   esac
 done
 
-say "run finished: $done_count issue(s) landed, $(wc -l < "$SKIPPED" | tr -d ' ') abandoned"
+say "run finished: $done_count issue(s) landed, $(abandoned_this_run) abandoned"
+# What is in the skipped list but was not this run's doing. Worth a line of its own rather than being
+# folded into the count above: it is the difference between "this batch failed five times" and "five
+# issues are waiting for a reason that has nothing to do with tonight".
+if [ "$(other_skipped)" -gt 0 ]; then
+  say "  ($(other_skipped) further issue(s) in $(basename "$SKIPPED") from earlier batches or held back by hand: $(other_skipped_list))"
+fi
 [ "$retried" -gt 0 ] && say "re-attempted $retried abandoned issue(s) on the batch's final tree: $retry_landed landed, $((retried - retry_landed)) still need a human"
 # This run's spend, and the log directory's, separately. They differ whenever LOGS has been used
 # before, which is the normal case here — and the single glob total used to be reported as "total

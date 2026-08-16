@@ -128,6 +128,19 @@ pushing or closing an issue on its own. Keep it that way: no token in `.git/conf
 `~/.git-credentials`, no mounted key. Those are all files an implementer can read; an environment
 variable the harness removes before it calls the model is not.
 
+The corollary caught us out, so it is worth stating: **git does not read `GH_TOKEN`.** `gh` does, which
+is why every `gh` call worked, the preflight's `gh auth status` passed, and `git push` could not have
+authenticated at all — no helper, no terminal to ask for a username, exit 128. Every batch had set
+`NO_PUSH=1`, so the first run that meant to deliver would have been the one to find out. `run.sh` now
+passes `-c credential.https://github.com.helper='!gh auth git-credential'` at each push and proves a
+credential resolves during preflight.
+
+That helper is the one that keeps the property above rather than breaking it. It shells out to `gh`,
+which reads the token from its own environment per call, so nothing lands on disk — where
+`credential.helper store`, the obvious alternative, writes the PAT into exactly the
+`~/.git-credentials` this section says not to have. And it does not give an implementer a way back to
+the token: with `GH_TOKEN` stripped, `gh` cannot authenticate, so the helper answers with nothing.
+
 ## 5. Check before committing to a night
 
 ```bash
