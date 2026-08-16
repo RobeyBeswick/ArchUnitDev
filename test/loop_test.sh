@@ -449,10 +449,53 @@ scenario_pushfail() {
   [ "$RC" -ne 0 ]; want $? "the run stops rather than carrying on"
   want_grep "push failed for #2" "$ROOT/run.out" "and says which issue"
   want_grep "the issue stays OPEN" "$ROOT/run.out" "and that the issue was not resolved"
+
+  # Why it failed, in git's words, in the file that gets shipped and read. The day #42 was refused for a
+  # missing `workflow` token scope the reason was in the container's stdout and nowhere in run.log, and
+  # no wording this message could have chosen would have guessed it.
+  want_grep "git said:" "$ROOT/run.out" "and quotes git's own reason"
+  want_grep "git said:" "$LOGS/run.log" "including in run.log, not only on stdout"
+  [ "$(grep -c 'push failed for #2' "$LOGS/run.log")" = 1 ]
+  want $? "as one grep-able line, not a multi-line entry"
+
   [ -f "$STUB_DIR/closed" ] && bad "the issue was closed with nothing on origin" \
                             || ok "the issue was NOT closed"
   [ "$(commits)" = 2 ]; want $? "the work is still committed locally, so nothing is lost"
   want_no_grep "DONE" "$ROOT/run.out" "the issue was not reported as done"
+}
+
+# A token that can reach github.com is not the same as a token allowed to do the job. GitHub refuses any
+# push that creates or updates a file under .github/workflows/ unless the token carries the `workflow`
+# scope, and it refuses it at the push — #42, the docs site, needs a Pages workflow, and was gated green
+# four rounds deep before being rejected at the end of two hours. So it is said at preflight instead.
+scenario_workflow_scope() {
+  local HERMETIC=(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1)
+  setup
+  git -C "$REPO" remote set-url origin https://github.com/example/example.git
+
+  run_loop happy PREFLIGHT_ONLY=1 STUB_GH_CRED=stub-token STUB_GH_SCOPES='gist,repo,workflow' "${HERMETIC[@]}"
+  want "$RC" "a token carrying the workflow scope passes preflight"
+  want_no_grep "no 'workflow' scope" "$ROOT/run.out" "and is not warned about"
+  want_no_grep "reports no OAuth scopes" "$ROOT/run.out" "nor mistaken for one that reports none"
+
+  run_loop happy PREFLIGHT_ONLY=1 STUB_GH_CRED=stub-token STUB_GH_SCOPES='gist,repo,read:org' "${HERMETIC[@]}"
+  want "$RC" "a token without it is warned about rather than refused — most issues never touch a workflow"
+  want_grep "no 'workflow' scope" "$ROOT/run.out" "and the warning names the scope"
+  want_grep "REFUSED at the push" "$ROOT/run.out" "and says where it would go wrong"
+
+  # A fine-grained PAT sends no scope header at all. Absent is unknown, not empty, and saying "no
+  # workflow scope" about a token that may well have the permission would train the reader to ignore it.
+  run_loop happy PREFLIGHT_ONLY=1 STUB_GH_CRED=stub-token "${HERMETIC[@]}"
+  want "$RC" "a token that reports no scopes is not refused either"
+  want_grep "reports no OAuth scopes" "$ROOT/run.out" "and is described as unknown rather than missing"
+  want_no_grep "no 'workflow' scope" "$ROOT/run.out" "not as definitely lacking the scope"
+
+  run_loop happy PREFLIGHT_ONLY=1 NO_PUSH=1 STUB_GH_SCOPES='gist,repo' "${HERMETIC[@]}"
+  want "$RC" "a NO_PUSH run still passes"
+  want_no_grep "no 'workflow' scope" "$ROOT/run.out" "and is not warned: it pushes nothing"
+
+  # The header the real API also sends, which the scope reader must not pick up instead.
+  want_no_grep "Accepted" "$ROOT/run.out" "X-Accepted-Oauth-Scopes is not mistaken for the scope list"
 }
 
 # Consecutive abandonments mean the environment broke, not that every issue is hard. The run must
@@ -1067,7 +1110,7 @@ scenario_carry_default_off() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning test_files_guard push_credential abandon_count pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
+ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning test_files_guard push_credential workflow_scope abandon_count pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then

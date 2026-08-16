@@ -289,6 +289,24 @@ case "$(git remote get-url origin)" in
       GIT_TERMINAL_PROMPT=0 git "${GIT_CRED[@]}" credential fill \
           <<<$'protocol=https\nhost=github.com\n' >/dev/null 2>&1 \
         || die "git cannot get a credential for github.com, so every push this run makes would fail with 'could not read Username'. gh being authenticated is not the same thing: gh reads GH_TOKEN and git does not. Set NO_PUSH=1 to run without pushing."
+
+      # A reachable credential is not the same as one allowed to do the job. GitHub refuses a push that
+      # creates or updates anything under .github/workflows/ unless the token carries the `workflow`
+      # scope, and it refuses it *at the push* — after the implement, the gate and every critic have
+      # been paid for. #42 (the docs site, which has to add a Pages workflow) was gated green four
+      # rounds deep and then rejected for exactly this, at the end of two hours.
+      #
+      # Not a die(): the queue cannot know in advance which issue will touch a workflow file, and most
+      # do not, so refusing every run over a scope most runs never need would be worse than the miss.
+      # Said at preflight instead, where it is at the head of the log rather than buried at the end.
+      #
+      # X-OAuth-Scopes is sent for a classic token only. A fine-grained PAT lists no scopes at all, so
+      # an absent header means unknown rather than missing, and is worded that way.
+      case "$(gh api -i user 2>/dev/null | tr -d '\r' | sed -n 's/^[Xx]-[Oo][Aa]uth-[Ss]copes: *//p')" in
+        *workflow*) ;;
+        "") say "WARNING: the token reports no OAuth scopes, which is what a fine-grained PAT does — so whether it may write .github/workflows/ cannot be checked here. An issue that touches a workflow file may pass every check and still be refused at the push." ;;
+        *) say "WARNING: the token has no 'workflow' scope. Any issue that adds or edits a file under .github/workflows/ will pass the gate and every critic and then be REFUSED at the push, with the work committed locally and the issue left open. Add the scope before running such an issue." ;;
+      esac
     fi
     ;;
 esac
@@ -778,7 +796,7 @@ SWEEP
       say "#$N DONE"
       done_count=$((done_count + 1))
       consecutive_abandons=0
-    elif git "${GIT_CRED[@]}" push -q origin HEAD; then
+    elif push_err=$(git "${GIT_CRED[@]}" push -q origin HEAD 2>&1); then
       # The commit message closes the issue by itself once it is on the default branch; this is the
       # belt to that braces, and it is also what leaves the review trail on the issue.
       say "#$N pushed as $landed_as"
@@ -792,7 +810,11 @@ SWEEP
       # so the issue is not resolved and must not be closed. Stopping rather than carrying on: every
       # later push fails the same way, and a run that closes issues while nothing reaches origin is
       # the worst outcome available.
-      die "push failed for #$N — the commit is local only ($landed_as), so the issue stays OPEN. Nothing after this would reach origin either. Fix the remote and run again: the queue resumes from the issues still open."
+      # git's own words, or the reader has to go and find them. They were in the container's stdout and
+      # not in run.log the day #42 was refused for a missing `workflow` token scope, which is a reason
+      # nothing in this message could have guessed — and run.log is the file that gets shipped and read.
+      # Newlines collapsed because this file is scanned with grep, and a multi-line entry hides from it.
+      die "push failed for #$N — the commit is local only ($landed_as), so the issue stays OPEN. Nothing after this would reach origin either. Fix the remote and run again: the queue resumes from the issues still open. git said: $(printf '%s' "$push_err" | tr '\n' ' ')"
     fi
   else
     # Abandon: keep the work on a branch so nothing is lost, reset main, move on.
