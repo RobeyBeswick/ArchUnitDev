@@ -30,6 +30,16 @@ case "${1:-} ${2:-}" in
     [ "${3:-}" = get ] || exit 0
     printf 'username=x-access-token\npassword=%s\n' "$STUB_GH_CRED" ;;
 
+  # `gh api -i user`, which run.sh reads for the token's scopes. The header is the whole point, so this
+  # prints headers and a body the way the real thing does. STUB_GH_SCOPES unset means the header is
+  # absent altogether, which is what a fine-grained PAT does and is a third case rather than an empty
+  # second one.
+  "api -i")
+    printf 'HTTP/2.0 200 OK\r\n'
+    [ -z "${STUB_GH_SCOPES+x}" ] || printf 'X-OAuth-Scopes: %s\r\n' "$STUB_GH_SCOPES"
+    printf 'X-Accepted-Oauth-Scopes: \r\n'
+    printf '\r\n{"login":"stub"}\n' ;;
+
   "issue list")
     if wants length "$@"
       then grep -c . "$open"
