@@ -47,8 +47,17 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH="/home/dev/.local/bin:${PATH}"
 
 # safe.directory matters: the target repo is bind-mounted and will not be owned by dev.
-RUN git config --global user.name  "ArchUnitDev loop" \
- && git config --global user.email "loop@archunitdev.invalid" \
+#
+# The identity is the owner's own, and the email is the part that matters. GitHub attributes a commit to
+# an account by matching the *author* email against the verified addresses on it, and nothing else — not
+# the pushing credential, not the committer. The address this used to carry, loop@archunitdev.invalid,
+# was under a reserved TLD that can never receive mail and so can never be verified, which made every
+# commit the loop landed work that belongs to no account and counts for nobody. The form below is the
+# account's noreply address: the one address guaranteed to be verified, and one that publishes no real
+# inbox. That the work was machine-written is recorded where it belongs — the Co-Authored-By trailer on
+# every commit — rather than in an author field, where it costs the owner their own history.
+RUN git config --global user.name  "Robey Beswick" \
+ && git config --global user.email "88316323+RobeyBeswick@users.noreply.github.com" \
  && git config --global --add safe.directory /work/repo
 
 # GOPATH moves under $HOME because the module cache has to be writable by dev — later issues add
