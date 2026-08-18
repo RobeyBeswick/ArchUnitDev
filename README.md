@@ -223,7 +223,10 @@ spend and the directory's lifetime spend as two separate numbers.
 
 ## Auth
 
-Inference goes through **Amazon Bedrock** (account `<aws-account-id>`, `us-east-1`). The image sets
+Inference goes through **Amazon Bedrock**, in the account and region named by `deploy/local.env`
+(`AWS_ACCOUNT_ID` and `AWS_REGION` — copy `deploy/local.env.example` and fill it in; the copy is
+git-ignored, because naming an account and a bucket in a public repository is publishing an inventory
+of them). The image sets
 `CLAUDE_CODE_USE_BEDROCK=1`, and `run.sh` verifies credentials with `aws sts get-caller-identity`
 before the first issue rather than failing an hour into the night. No `ANTHROPIC_API_KEY` is involved.
 
@@ -234,10 +237,12 @@ without further work.
 
 Two things to get right:
 
-- **Do not set `AWS_PROFILE` in the container, and do not mount `~/.claude/settings.json`.** The host's
-  `claude-code` profile resolves credentials with `credential_process = <credential-helper>`, and
-  `<credential-helper>` does not exist in the image — so a container that inherits `AWS_PROFILE` fails to authenticate
-  even though the instance profile would have worked. `run.sh` warns when it sees this combination.
+- **Do not set `AWS_PROFILE` in the container, and do not mount `~/.claude/settings.json`.** A host
+  profile that resolves credentials through a `credential_process` names a helper binary, and that
+  binary does not exist in the image — so a container that inherits `AWS_PROFILE` fails to
+  authenticate even though the instance profile would have worked. It reads in the log as "no
+  credentials" rather than as the wrong profile, which is why `run.sh` warns on the combination by
+  name.
 - **Raise the IMDS hop limit to 2.** Docker's default bridge network adds a hop, and the EC2 default of
   `http-put-response-hop-limit = 1` therefore blocks containers from reaching IMDS at all:
 
@@ -253,7 +258,8 @@ finishes well inside their lifetime, and `run.sh` warns that they will not refre
 `--env-file` keeps them off the command line and out of your shell history:
 
 ```bash
-$AWS_CREDS_CMD | tr ' ' '\n' > /tmp/aws.env
+set -a && . deploy/local.env && set +a     # AWS_CREDS_CMD: your federation tool, and the account it points at
+eval "$AWS_CREDS_CMD" | tr ' ' '\n' > /tmp/aws.env
 ```
 
 Egress needed: `bedrock-runtime.*.amazonaws.com` (the pinned model is a *global* inference profile, so
@@ -313,7 +319,8 @@ tail -f logs/run.log
 From a laptop, one issue, committing locally but pushing nothing:
 
 ```bash
-$AWS_CREDS_CMD | tr ' ' '\n' > /tmp/aws.env
+set -a && . deploy/local.env && set +a
+eval "$AWS_CREDS_CMD" | tr ' ' '\n' > /tmp/aws.env
 
 docker run --rm -it \
   --env-file /tmp/aws.env \

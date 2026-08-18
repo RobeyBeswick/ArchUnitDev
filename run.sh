@@ -226,12 +226,27 @@ fi
 # Auth. Three ways in; check the one actually configured, and fail now rather than on
 # the first invocation an hour into the night.
 if [ "${CLAUDE_CODE_USE_BEDROCK:-}" = "1" ]; then
-  # The trap: AWS_PROFILE pointing at a credential_process that does
-  # not exist inside the container. Unset it and let the instance profile answer.
-  if [ -n "${AWS_PROFILE:-}" ] && ! command -v <credential-helper> >/dev/null 2>&1; then
-    say "WARNING: AWS_PROFILE=$AWS_PROFILE is set but '<credential-helper>' is not on PATH — if that profile uses credential_process, credentials cannot resolve. Unset AWS_PROFILE to fall back to the EC2 instance profile."
-  fi
   command -v aws >/dev/null || die "CLAUDE_CODE_USE_BEDROCK=1 but the aws CLI is not installed, so credentials cannot be verified"
+  # The trap: an AWS_PROFILE that resolves on the host and cannot resolve in here. Both shapes of it
+  # fail the same misleading way — the SDK reports no credentials, so the log reads as a missing role
+  # rather than as an inherited variable — and in both, unsetting it lets the instance profile answer.
+  # The helper is read out of the config rather than hardcoded, so this holds for whichever one is in
+  # use, and the profile-not-found arm is what catches a container that got AWS_PROFILE through `-e`
+  # without the config file that defines it.
+  if [ -n "${AWS_PROFILE:-}" ]; then
+    # `| awk` and not `| grep -q`: awk drains its input, so pipefail cannot report the writer's
+    # SIGPIPE instead of the result. See the test that bans the other shape.
+    helper=$(aws configure get credential_process --profile "$AWS_PROFILE" 2>/dev/null | awk 'NR==1 {print $1}')
+    profiles=$(aws configure list-profiles 2>/dev/null)
+    if [ -n "$helper" ] && ! command -v "$helper" >/dev/null 2>&1; then
+      say "WARNING: AWS_PROFILE=$AWS_PROFILE resolves credentials by running '$helper', which is not on PATH here — they cannot resolve. Unset AWS_PROFILE to fall back to the EC2 instance profile."
+    else
+      case $'\n'"$profiles"$'\n' in
+        *$'\n'"$AWS_PROFILE"$'\n'*) : ;;
+        *) say "WARNING: AWS_PROFILE=$AWS_PROFILE is set but no such profile exists here — the SDK fails on a named profile it cannot find rather than falling through to the instance profile. Unset AWS_PROFILE." ;;
+      esac
+    fi
+  fi
   caller=$(aws sts get-caller-identity --query Arn --output text 2>&1) \
     || die "CLAUDE_CODE_USE_BEDROCK=1 but no usable AWS credentials: $caller"
   say "auth: Bedrock in ${AWS_REGION:-${AWS_DEFAULT_REGION:-unset-region}} as $caller"

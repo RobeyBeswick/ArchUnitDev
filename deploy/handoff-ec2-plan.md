@@ -18,8 +18,8 @@ estimated.
 
 ## 1. What the EC2 plan is
 
-One long-lived EC2 instance in the Bedrock account (<aws-account-id>, us-east-1), running the harness as a
-Docker container for hours, unattended, overnight.
+One long-lived EC2 instance in the Bedrock account (`AWS_ACCOUNT_ID` and `AWS_REGION` in
+`deploy/local.env`), running the harness as a Docker container for hours, unattended, overnight.
 
 **IAM.** A role `ArchUnitDevLoop` trusted by `ec2.amazonaws.com`, carrying
 `deploy/bedrock-invoke-policy.json` — `bedrock:InvokeModel` and `InvokeModelWithResponseStream` on

@@ -10,3 +10,12 @@ logs/
 *.tfvars
 .terraform.tfstate.lock.info
 crash.log
+
+# The account-specific values — account ID, log bucket, credential helper. Not secrets, but they name
+# real infrastructure, and this repository is public. deploy/local.env.example documents every one of
+# them and is committed; the filled-in copy is not.
+deploy/local.env
+
+# Agent scratch. A worktree checkout lives under here, so a `git add -A` would otherwise commit a
+# second copy of the whole repository.
+.claude/

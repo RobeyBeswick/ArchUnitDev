@@ -25,7 +25,12 @@
 #
 set -uo pipefail
 
-BUCKET=s3://<log-bucket>
+# The log bucket's name is account-specific, so it is not written down in this repository. The
+# bootstrap wrote it to /etc/profile.d, which a `sudo` of a script does not source — hence reading it
+# here, and hence BUCKET staying overridable for a run driven from anywhere else.
+[ -r /etc/profile.d/archunitdev.sh ] && . /etc/profile.d/archunitdev.sh
+BUCKET="${BUCKET:-${S3_LOGS:+${S3_LOGS%/loop}}}"
+[ -n "$BUCKET" ] || { echo "REFUSING: no log bucket. Set BUCKET=s3://... or run where /etc/profile.d/archunitdev.sh exists." >&2; exit 1; }
 REGION=us-east-1
 H=/home/ec2-user
 

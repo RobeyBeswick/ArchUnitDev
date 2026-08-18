@@ -107,9 +107,10 @@ classic PAT carries the access its owner has. Give it the shortest expiry that c
 
 ```bash
 # the account matters and there is no --account flag: identity comes from the credentials in use
-aws sts get-caller-identity --query Account --output text     # expect <aws-account-id>
-aws secretsmanager create-secret --region us-east-1 \
-  --name archunitdev/gh-token --secret-string 'ghp_...'
+set -a && . deploy/local.env && set +a
+aws sts get-caller-identity --query Account --output text     # expect $AWS_ACCOUNT_ID
+aws secretsmanager create-secret --region "$AWS_REGION" \
+  --name "$GH_TOKEN_SECRET" --secret-string 'ghp_...'
 ```
 
 Add the `workflow` scope only if a run will touch `.github/workflows/` — GitHub rejects such a push
