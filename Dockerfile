@@ -99,10 +99,10 @@ ENV REPO=/work/repo \
     LOGS=/work/logs \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
-# Inference goes through Bedrock. AWS_PROFILE is deliberately NOT set: the host profile
-# uses `credential_process = <credential-helper>`, which does not exist in here. With it
-# unset, the SDK credential chain falls through to the EC2 instance profile, which refreshes
-# itself and so survives a full overnight run.
+# Inference goes through Bedrock. AWS_PROFILE is deliberately NOT set: a host profile that
+# resolves credentials through a `credential_process` names a helper binary, and that binary
+# does not exist in here. With it unset, the SDK credential chain falls through to the EC2
+# instance profile, which refreshes itself and so survives a full overnight run.
 ENV CLAUDE_CODE_USE_BEDROCK=1 \
     AWS_REGION=us-east-1
 
