@@ -1,17 +1,118 @@
 # ArchUnitDev
 
 An unattended implement / review / fix loop that works through a repository's open GitHub issues with
-four Claude Code invocations: an **implementer**, a **correctness reviewer**, an **idiom critic** and a
-**test critic**.
+four opencode invocations: an **implementer**, a **correctness reviewer**, an **idiom critic** and a
+**test critic**. It was built to drive [ArchUnitGo](https://github.com/LukasNiessen/ArchUnitGo) from an
+empty repo to a working library across 44 dependency-ordered issues, but it is not specific to it beyond
+the prompts. This repo is the harness only; the target repo is bind-mounted at `/work/repo`.
 
-Built to drive [ArchUnitGo](https://github.com/LukasNiessen/ArchUnitGo) from an empty repo to a working
-library across 44 dependency-ordered issues, but it is not specific to it beyond the prompts.
+## Contents
 
-This repo is the harness only. The target repo is bind-mounted at `/work/repo`.
+- [What it is](#what-it-is)
+- [Quick start](#quick-start)
+- [How it works](#how-it-works)
+  - [The loop](#the-loop)
+  - [State](#state)
+  - [The gate](#the-gate)
+  - [Roles](#roles)
+  - [Preflight](#preflight)
+  - [Abandonment and retry](#abandonment-and-retry)
+  - [Spend cap](#spend-cap)
+  - [Retrospective](#retrospective)
+- [Configuration](#configuration)
+  - [Knobs](#knobs)
+  - [Authentication](#authentication)
+  - [Network egress](#network-egress)
+- [Testing](#testing)
+- [Cost](#cost)
+- [Limitations](#limitations)
+- [Design notes](#design-notes)
 
-## The loop
+## What it is
 
+- One run processes the queue of open GitHub issues in dependency order. Each issue goes through
+  implement → gate → review → fix rounds, and is committed, pushed and closed on unanimous approval.
+- Four agent roles per round: an implementer, a correctness reviewer, an idiom critic and a test critic.
+- It runs unattended overnight and is resumable — there is no state store, just git history.
+- It is the harness only. The target repo is bind-mounted at `/work/repo`.
+
+## Quick start
+
+Work up in three steps rather than trusting a fresh container with a night:
+
+```bash
+./test/loop_test.sh          # the harness itself, with stubbed opencode and gh. Costs nothing.
+PREFLIGHT_ONLY=1 ./run.sh    # auth, tools, repo, remote, queue. Costs nothing.
+MAX_ISSUES=1    ./run.sh     # issue #1 end to end. Costs a few dollars.
 ```
+
+The last one is the one that tells you whether the prompts, the commit and the push path work.
+
+### On EC2
+
+With opencode authenticated (`opencode auth login` inside the image, or a provider `*_API_KEY` env var),
+nothing else to pass but `GH_TOKEN`:
+
+```bash
+docker build -t archunitdev .
+
+nohup docker run --rm \
+  -e GH_TOKEN \
+  -e MODEL=opencode-go/deepseek-v4-pro \
+  -e FLASH_MODEL=opencode-go/deepseek-v4-flash \
+  -v "$PWD/ArchUnitGo:/work/repo" \
+  -v "$PWD/logs:/work/logs" \
+  archunitdev > loop.out 2>&1 &
+
+tail -f logs/run.log
+```
+
+### From a laptop (one issue, commit locally, push nothing)
+
+```bash
+docker run --rm -it \
+  -e GH_TOKEN="$(gh auth token)" \
+  -e MAX_ISSUES=1 -e NO_PUSH=1 \
+  -v "$HOME/.local/share/opencode:/home/dev/.local/share/opencode" \
+  -v "$HOME/Projects/ArchUnitGo:/work/repo" \
+  -v "$PWD/logs:/work/logs" \
+  archunitdev
+```
+
+Mounting `~/.local/share/opencode` carries your logged-in provider auth into the container. `aws` is no
+longer needed on `PATH` for inference — only for the optional EC2 plumbing in `deploy/`.
+
+### Directly (no Docker)
+
+Needs `opencode`, `gh`, `jq`, the Go toolchain and `golangci-lint` (>= v2.5.0,
+`brew install golangci-lint`) on `PATH`. opencode carries its own provider auth (`opencode auth login`
+or a `*_API_KEY` env var), so `MODEL=opencode-go/deepseek-v4-pro` works here:
+
+```bash
+REPO=/Users/rbz/Projects/ArchUnitGo LOGS=./logs MAX_ISSUES=1 ./run.sh
+```
+
+### Logs
+
+`run.log` is the one-line-per-step narration. Everything else in `logs/` is per-invocation detail:
+`N-implement.json` (the full envelope, including `total_cost_usd`), `N-review-1.verdict.json`,
+`N-diff-1.patch`, `N-gate-1.txt`, and `*.debug.log`.
+
+Two of the files in `logs/` are state rather than output — the only state the harness keeps outside git
+and the issues themselves:
+
+- `skipped` — issues abandoned after `MAX_ROUNDS`; an issue is taken back off it if a re-attempt lands.
+  The queue and the retrospective both read it.
+- `landed` — issues implemented but deliberately left open, which only happens under `NO_PUSH`. Pruned at
+  startup of any entry whose issue has closed, so reopening an issue keeps it visible to the queue.
+
+Both are excluded from the queue. Delete them to make the loop reconsider an issue.
+
+## How it works
+
+### The loop
+
+```text
 for the lowest-numbered open issue:
 
     implementer  ──▶  ┌─ gate.sh ────────── build, vet, golangci-lint, test -race, cross-compile
@@ -37,331 +138,88 @@ once the batch is done, if RETRO=1:
 
 `×2`: the roles in `DOUBLE_CRITICS` run twice in round 1, differently prompted, findings unioned.
 
-**There is no state store.** The queue is "the lowest-numbered open issue", progress is the git history,
-and the audit trail is the closed issues plus `NOTES.md` in the target repo. A killed run is resumed by
+### State
+
+There is no state store. The queue is "the lowest-numbered open issue", progress is the git history, and
+the audit trail is the closed issues plus `NOTES.md` in the target repo. A killed run is resumed by
 running the script again.
 
-## Why it is shaped this way
+### The gate
 
-**The deterministic gate runs before the reviewers.** `go build`, `go vet ./...`, `golangci-lint`,
-`go test -race -shuffle=on -covermode=atomic`, `go mod tidy -diff`, and a cross-compile for
-`windows/amd64` and `linux/386`. No model tokens are ever spent reviewing code that does not compile,
-and a gate failure does not consume a review round.
+`gate.sh` runs the deterministic checks before any reviewer sees the diff: `go build`, `go vet ./...`,
+`golangci-lint`, `go test -race -shuffle=on -covermode=atomic`, `go mod tidy -diff`, and a cross-compile
+for `windows/amd64` and `linux/386`. A gate failure goes to the fixer and does not consume a review round.
 
-**The architecture rules live in the target repo's `.golangci.yml`, not in `gate.sh`.** They used to be
-`grep`s over import lines. They are now `depguard` rules over the *resolved* import graph, so an
-aliased, blank or line-wrapped import cannot slip past them — and the implementer can run exactly the
-check the gate will run, before it finishes. `AGENTS.md`'s dependency rules 1–3, the purity rule for
-`assertion`/`projection`/`calculation`, "globs compile to regex in one place" and the doc-comment rules
-are all expressed there. Rule 4 (*nothing imports the root package*) is the one `depguard` structurally
-cannot express, because it matches path prefixes and the public surface's path is the module path
-itself, so the idiom critic owns that one by hand.
+### Roles
 
-**Preflight's job is the failures that do not announce themselves.** A blocked module proxy is the
-clearest example, because of *how* it fails: `go get` on an unreachable proxy does not error, it hangs
-past 30 seconds with no output, so the implementer spends its wall clock waiting, gets killed by
-`TIMEOUT`, and hands back an unfinished issue with nothing in the log pointing at DNS — and then does
-it again for every issue after that. One 15-second read-only `go list -m` at startup turns that into a
-line naming the cause and the fix. It warns rather than dying, because most issues add no dependency
-and killing a night's run over a proxy nothing in the queue needs would cost more than it saves.
+Each round invokes the four agents concurrently:
 
-Two more consequences, both handled in preflight rather than discovered in the morning: a missing
-`golangci-lint` binary and a missing `.golangci.yml` are **fatal**, not warnings. Either one makes the
-gate go green while checking a fraction of what it claims to — golangci-lint with no config silently
-falls back to five default linters. `ALLOW_NO_LINT=1` overrides both and drops back to the grep
-fallbacks, with a loud banner in the gate log.
+- **implementer** — writes the diff.
+- **correctness reviewer** — owns correctness and the data-model invariants.
+- **idiom critic** — owns conformance to `AGENTS.md`: the fluent-API grammar, the naming table, the
+  layout and the four dependency rules.
+- **test critic** — owns whether the tests would fail if the code were wrong.
 
-**Moving those checks out of the prompts is what makes the critics useful.** Both critic prompts open
-with an explicit list of what the toolchain has already proven, and an instruction not to report any of
-it. A critic spending its round on a missing doc comment is a round not spent on the things no linter
-can see: a fixture that cannot physically produce the violation it claims to test, a doc comment that is
-well-formed but false, or a value-receiver builder doing `append(b.xs, x)` without a clone — which
-compiles, passes every linter, passes single-branch tests, and silently corrupts one branch of a
-half-built rule whenever `cap > len`.
+The critics are read-only by agent permission (the `readonly` agent denies write/bash) and never touch
+`git`; the harness generates the diff and pipes it in. Verdicts are JSON (`{verdict, findings[]}`)
+validated with `jq` from the critic's text, so there are no `grep '^APPROVED'` false positives — a
+critic that did not answer in JSON fails closed exactly like one that crashed. Approval is unanimous.
 
-**The critics cannot write.** They are restricted with `--tools "Read,Grep,Glob"`, so read-only is a
-property of the invocation rather than a promise in a prompt. They never touch `git` either — the
-harness generates the diff and pipes it in.
+### Preflight
 
-**Verdicts are validated JSON, not a sentinel string.** `--json-schema` forces `{verdict, findings[]}`
-into the response's `structured_output` field, which the loop reads with `jq`. No `grep '^APPROVED'`
-false positives.
+Before the first issue, preflight verifies auth, tools, repo, remote and queue. Its job is the failures
+that do not announce themselves:
 
-**Everything fails closed.** A critic that crashes or times out counts as `FAIL`, never as a silent pass.
-Approval is unanimous, and the critics run concurrently, so a third reviewer costs about a dollar a round
-and no wall-clock at all.
+- **Blocked module proxy** (warning). `go get` on an unreachable proxy hangs past 30 seconds with no
+  output, so the implementer gets killed by `TIMEOUT` with nothing in the log pointing at DNS — and then
+  does it again for every issue. One 15-second read-only `go list -m` at startup turns that into a line
+  naming the cause and the fix. It warns rather than dying, because most issues add no dependency.
+- **Missing `golangci-lint` binary** (fatal). The gate would go green while checking a fraction of what
+  it claims.
+- **Missing `.golangci.yml`** (fatal). `golangci-lint` with no config silently falls back to its five
+  default linters.
 
-**The three critics do not overlap**, and keeping them disjoint is the whole design. The reviewer owns
-correctness and the data-model invariants. The idiom critic owns conformance to `AGENTS.md` — the
-fluent-API grammar, the naming table, the layout and the four dependency rules. The test critic owns
-whether the tests would fail if the code were wrong. All three are told to return `PASS` when their only
-findings are cosmetic, which is what stops the idiom critic becoming a rename generator that never
-approves. Each round, only the critics that actually found something contribute a section to the fixer's
-prompt.
+`ALLOW_NO_LINT=1` overrides both fatal checks and drops back to the grep fallbacks, with a loud banner in
+the gate log.
 
-**The test critic exists because the other two demonstrably missed this class of defect.** On issue #2
-both returned `PASS` with no findings, and the diff contained a `TestFiltersAreImmutable` that passed
-against a `Filter.Excluding` with its `slices.Clone` deleted — it asserted only that the *parent* was
-unchanged, which is true even with the bug, because appending to a nil slice always allocates. Run
-against that same diff afterwards, the test critic found it, plus a second gap nobody had noticed: the
-separator normalisation in `Filter.Matches` could be deleted with the whole suite still green, because
-`Pattern.Matches` normalises a second time and no Filter-level test ever passed a backslash. Both were
-confirmed by mutating the code and re-running.
+### Abandonment and retry
 
-It has since done the same thing inside the loop, on its first live run. On issue #5 the implementer's
-`WithDefaults` returned a bare `*o`, which copies the struct but leaves `BuildTags` pointing at the
-caller's backing array — a terminal appending a build tag to its resolved options would write through
-into the user's own. The correctness reviewer and the idiom critic passed it in every round. The test
-critic blocked on the test instead of the code: the aliasing test only asserted that the caller was
-unchanged, and the one field where copying is a real decision was never touched. The fixer's response
-was to add the `slices.Clone`. Three instances of that bug class so far, and this reviewer has caught
-all three.
+- **Abandon.** After `MAX_ROUNDS` fixes and one final judged round, the work is committed to
+  `abandoned/issue-N`, pushed, and the target repo reset to the base commit. The commit message carries
+  the reason and the verdicts its tip was judged on — the handoff to whoever picks the issue up.
+- **Retry.** The backlog is numbered in dependency order, so an abandonment leaves a hole in the middle
+  of an ordered queue. When the queue is done, every issue this run abandoned is re-attempted once on the
+  tree the batch actually reached — a fresh implementer on a bigger base, not a fourth fix round on a
+  diff that had stopped converging.
 
-The same issue is the argument for its round-2 finding too, and against how it delivered it: the second
-verdict said the test never asserted that the resolved copy *carries* the caller's values, so
-`WithDefaults` dropping four of six fields was undetectable — which was equally true of the round-1
-test. Two findings about one test, one round apart, on an issue that then landed on the last round it
-had. All three prompts now say to report everything blocking in one pass, because a held-back finding
-is a round the issue may not have.
+The retry is fenced three ways:
 
-**And because telling it to is not the same as it doing it, round 1 runs that critic twice.** The
-instruction above is what a prompt can do about a held-back finding; it did not stop #26 from spending a
-round on the same shape of thing. So the roles named in `DOUBLE_CRITICS` (the test critic, by default)
-get two concurrent invocations in round 1, and the loop unions their findings into the one verdict the
-rest of the round reads. The two are not copies: the second is told that another instance is already
-reporting whatever it considers most important, and that its own job is the opposite one — walk the
-changed files and name *every* instance rather than the worst, because a finding held back for being
-smaller than another one is a finding nobody makes.
+- Only issues **this run** abandoned — an entry already in `skipped` is a human's call.
+- Only when **the base moved** — otherwise the same prompts over the same tree fail the same way.
+- Only **once** — a re-attempt that fails again parks on `abandoned/issue-N-attempt-2`.
 
-Two identical passes would be the weakest way to spend that money; the value is in the different
-framing, not the redundancy. It is round 1 only, because a round-1 finding costs a fix round and a
-round-3 finding costs a fix round *and* the two rounds already spent — the marginal round is where
-completeness is worth paying for. And the union lands at the canonical `$TAG-$role-$round.verdict.json`,
-FAIL if either pass failed, so the unanimity check, the fixer's prompt and `retro.sh`'s round table are
-all unchanged: each pass's own verdict stays on disk beside it as evidence, and nothing downstream has
-to know a role can be plural. At about a dollar a pass, concurrent, it costs no wall-clock and less than
-a fifth of the round it is trying to avoid.
+The re-attempt is handed the findings still outstanding when the first attempt was abandoned, under a
+heading that says what they are. It is exempt from `MAX_ISSUES` (a re-attempt of #21 is still #21) and
+does not run after `MAX_CONSECUTIVE_ABANDONS` trips (a broken environment is the one case where spending
+again is certainly wrong). Set `RETRY_ABANDONED=` to switch it off.
 
-Its prompt is built on one mechanism — **name the mutation**. For every test, state the one-line change
-to the implementation that makes it fail; if you cannot, the test asserts nothing and that is a block.
-It is explicitly forbidden from reporting coverage percentages (there is no threshold in the gate) or
-asking for a test without naming what would break, which is how a test reviewer turns into a
-work generator.
+### Spend cap
 
-**Reward hacking is checked for explicitly.** The cheapest way to make `go test` pass is to stop running
-the tests, so `gate.sh` fails on `t.Skip` (unless the line carries an `ALLOW-SKIP: <reason>`, so a
-genuinely platform-specific skip cannot deadlock the loop), on a commented-out test function, on a
-module with no tests, and on **a test-function count lower than at the base commit** — which is the one
-thing coverage cannot tell you, because a deleted test takes its uncovered lines with it. `errcheck`
-with `check-blank` covers `_ =`, and `go vet`/`SA4011` cover `if false`. Both critics are told to treat a
-weakened check as always blocking, and the fixer is told that weakening `.golangci.yml` counts as
-weakening the checks.
+`MAX_SPEND` bounds the run in dollars, not issues — `MAX_ISSUES` bounds a count, and issues do not cost
+the same. The cap stops the run at the first issue boundary where this run's spend has reached it, and
+every boundary narrates the running total whether or not a cap is set.
 
-**A test that cannot fail is the same defect wearing a passing suite.** The gate now also requires that
-every `const Kind... = "literal"` has its *string value* asserted by a literal somewhere in the tests.
-Every test in the tree compares `Kind()` against the constant, which is a tautology: respell the
-constant and the suite stays green, including respelling it onto a collision with a sibling kind, which
-the data model says cannot happen. The test critic found precisely this on #21, and it cost a full round
-— $5.05 of critics and fixer — to report and fix something a `grep` decides for nothing.
-
-It is base-relative, like the test count, and for the same reason: `KindFileDependency` landed unpinned
-in #20 with all three critics passing it, so a check that failed on the tree's existing holes would
-hand the next issue's implementer somebody else's work and burn its rounds on it. What is forbidden is
-*adding* one; what is already unpinned is reported as pre-existing and passes. Verified against the real
-history before it shipped — it fails on the commit that introduced the hole and passes on the one before.
-
-**Nothing is lost when an issue defeats the loop.** After `MAX_ROUNDS` fixes and a final judged round,
-the work is committed to `abandoned/issue-N`, pushed, and the target repo is reset to the base commit
-so the next issue starts from a clean tree. The commit message carries the reason and the verdicts its
-tip was judged on, because that branch is the handoff to whoever picks the issue up.
-
-**And the issue gets one more attempt before the run ends.** The backlog is numbered in dependency
-order, so an abandonment leaves a hole in the middle of an ordered queue while everything after it
-keeps landing on top: #21 was an unimplemented Files API terminal, #22–#26 landed over it, and the
-batch finished with five commits of kernel sitting above a gap that the abandoned issue had been the
-prerequisite for. So when the queue is done, every issue *this run* abandoned is re-attempted once
-against the tree the batch actually reached — a fresh implementer on a bigger base, not a fourth fix
-round on a diff that had stopped converging.
-
-Three things keep that from being a licence to spend twice. Only issues this run abandoned: an entry
-already in `skipped` is one a human parked, and re-attempting it is that human's call. Only when the
-base moved: if nothing landed after the issue, the re-attempt would run the same prompts over the same
-tree and fail the same way, so it is skipped — which means the pathological batch where *everything*
-abandons retries nothing and costs nothing. And once: a re-attempt that fails again parks on
-`abandoned/issue-N-attempt-2`, beside the first attempt rather than on top of it, and stops there.
-
-The re-attempt is not, however, told nothing. It gets the findings that were still outstanding when the
-first attempt was abandoned — the last round that produced any, from every critic that produced them —
-under a heading that is explicit about what they are: a previous attempt was parked on
-`abandoned/issue-N`, it is not in this tree, you are not resuming it, and you are free to solve the
-issue a different way. What you are not free to do is reproduce these. Without that, the second
-implementer starts from the issue text alone and the loop's best evidence about where this particular
-issue is hard — three rounds of it — is on a branch nobody reads.
-
-The retry is exempt from `MAX_ISSUES`, because a re-attempt of #21 is still #21 and adds nothing to the
-set of issues the run was scoped to. Bounding the run instead of the main pass would make the retry
-unreachable in every batch that fills its bound — that is, every batch that goes well. It does not run
-after `MAX_CONSECUTIVE_ABANDONS` trips, because a broken environment is the one case where spending
-again is certainly wrong. Set `RETRY_ABANDONED=` to switch it off.
-
-**The run can be bounded in dollars, not just in issues.** `MAX_ISSUES` bounds a count, and issues do
-not cost the same: one lands in two rounds for $8 and the next takes six rounds of fixes and critics for
-$60. So a night scoped by issue count has no ceiling anyone can state in advance — 18 issues is
-somewhere between $150 and $1,000. `MAX_SPEND=400` stops the run at the first issue boundary where this
-run's spend has reached $400, and every boundary narrates the running total whether or not a cap is set,
-so the answer to "what did last night cost" is in the log while it is still running rather than only at
-the end.
-
-It is checked *between* issues and deliberately nowhere else. An issue killed part-way through has an
-unjudged diff in the working tree and no branch to its name, which is the outcome the whole abandon path
-exists to prevent — so the cap bounds what the run *starts*, and overshooting by up to one issue is the
-price of never abandoning work mid-flight. Spend is summed from the `total_cost_usd` in each
-invocation's result JSON, counting only files newer than a marker touched at startup: `logs/` is
-long-lived and holds every batch ever run into it, so a cap measured over the directory would refuse to
-start tonight because last night spent it. For the same reason the end-of-run line reports this run's
+It is checked *between* issues and deliberately nowhere else: an issue killed part-way through has an
+unjudged diff and no branch, which is the outcome the abandon path exists to prevent. Spend is summed
+from the `total_cost_usd` in each invocation's result JSON, counting only files newer than a marker
+touched at startup (`logs/` is long-lived and holds every batch). The end-of-run line reports this run's
 spend and the directory's lifetime spend as two separate numbers.
 
-## Auth
+### Retrospective
 
-Inference goes through **Amazon Bedrock**, in the account and region named by `deploy/local.env`
-(`AWS_ACCOUNT_ID` and `AWS_REGION` — copy `deploy/local.env.example` and fill it in; the copy is
-git-ignored, because naming an account and a bucket in a public repository is publishing an inventory
-of them). The image sets
-`CLAUDE_CODE_USE_BEDROCK=1`, and `run.sh` verifies credentials with `aws sts get-caller-identity`
-before the first issue rather than failing an hour into the night. No `ANTHROPIC_API_KEY` is involved.
-
-**Use an EC2 instance profile.** Attach a role to the instance with `bedrock:InvokeModel` and
-`bedrock:InvokeModelWithResponseStream`, and the SDK credential chain inside the container picks it up
-from IMDS and refreshes it indefinitely. This is the only option that survives a full overnight run
-without further work.
-
-Two things to get right:
-
-- **Do not set `AWS_PROFILE` in the container, and do not mount `~/.claude/settings.json`.** A host
-  profile that resolves credentials through a `credential_process` names a helper binary, and that
-  binary does not exist in the image — so a container that inherits `AWS_PROFILE` fails to
-  authenticate even though the instance profile would have worked. It reads in the log as "no
-  credentials" rather than as the wrong profile, which is why `run.sh` warns on the combination by
-  name.
-- **Raise the IMDS hop limit to 2.** Docker's default bridge network adds a hop, and the EC2 default of
-  `http-put-response-hop-limit = 1` therefore blocks containers from reaching IMDS at all:
-
-  ```bash
-  aws ec2 modify-instance-metadata-options \
-    --instance-id i-xxxxxxxx --http-tokens required --http-put-response-hop-limit 2
-  ```
-
-  Or run the container with `--network host` and skip it.
-
-For a smoke test from a laptop there is no IMDS to read, so pass short-lived credentials in. One issue
-finishes well inside their lifetime, and `run.sh` warns that they will not refresh. Writing them to an
-`--env-file` keeps them off the command line and out of your shell history:
-
-```bash
-set -a && . deploy/local.env && set +a     # AWS_CREDS_CMD: your federation tool, and the account it points at
-eval "$AWS_CREDS_CMD" | tr ' ' '\n' > /tmp/aws.env
-```
-
-Egress needed: `bedrock-runtime.*.amazonaws.com` (the pinned model is a *global* inference profile, so
-it may route across regions), `github.com` and `api.github.com` for `gh`, and somewhere to resolve Go
-modules from — the extractor depends on `golang.org/x/tools`, so `go build` inside the gate needs it.
-Which host that is depends on `GOPROXY`:
-
-| `GOPROXY` | Needs |
-|---|---|
-| default | `proxy.golang.org` + `sum.golang.org` |
-| `direct` | the VCS host of every dependency — `go.googlesource.com` for `x/tools` — plus `sum.golang.org` |
-
-The default is the narrower and faster of the two, which is why the image does not change it. Use
-`direct` (`-e GOPROXY=direct`) only where `proxy.golang.org` is blocked, and note that its egress set
-is open-ended: it is wherever the dependencies happen to be hosted, so it cannot be pinned in a policy
-the way one proxy hostname can.
-
-The image build warms the module cache for `golang.org/x/tools`, so the first gate run does not spend
-the implementer's wall clock fetching it. That reduces the module traffic but **does not remove the
-need for it**, and the reason is worth knowing before you write an egress policy that assumes
-otherwise: what a warm cache cannot answer is *version resolution*. Adding a new import and running
-`go get golang.org/x/tools@latest` or `go mod tidy` asks "which version is latest", which is a network
-lookup with no cache fallback — verified: it fails under `GOPROXY=off` against a fully populated cache.
-Only once the version is pinned in `go.mod` is the whole build satisfiable offline, and then it needs
-a `go mod tidy` too, because `go get module@version` records no checksums for the module's own
-dependencies. So `go build` on a settled `go.mod` is offline-capable; the commit that first adds the
-dependency is not.
-
-The image build additionally needs `raw.githubusercontent.com` and `objects.githubusercontent.com` for
-the `golangci-lint` installer, plus whatever `GOPROXY` resolves to for the cache warm — pass
-`--build-arg GOPROXY=direct` if the build host is the blocked one. Neither is needed at run time.
-Notably **not** `api.anthropic.com`.
-
-A `GH_TOKEN` with `repo` scope is required regardless — the loop reads, comments on and closes issues,
-and pushes commits.
-
-> This harness does **not** use `--bare`. That flag skips `CLAUDE.md` auto-discovery, and ArchUnitGo's
-> `CLAUDE.md` is what points the agents at `AGENTS.md`. If you switch it on, pass the conventions in
-> explicitly with `--add-dir` or `--append-system-prompt`.
-
-## Running it
-
-On EC2 in the Bedrock account, with an instance profile attached — nothing to pass but `GH_TOKEN`:
-
-```bash
-docker build -t archunitdev .
-
-nohup docker run --rm \
-  -e GH_TOKEN \
-  -v "$PWD/ArchUnitGo:/work/repo" \
-  -v "$PWD/logs:/work/logs" \
-  archunitdev > loop.out 2>&1 &
-
-tail -f logs/run.log
-```
-
-From a laptop, one issue, committing locally but pushing nothing:
-
-```bash
-set -a && . deploy/local.env && set +a
-eval "$AWS_CREDS_CMD" | tr ' ' '\n' > /tmp/aws.env
-
-docker run --rm -it \
-  --env-file /tmp/aws.env \
-  -e GH_TOKEN="$(gh auth token)" \
-  -e MAX_ISSUES=1 -e NO_PUSH=1 \
-  -v "$HOME/Projects/ArchUnitGo:/work/repo" \
-  -v "$PWD/logs:/work/logs" \
-  archunitdev
-```
-
-Directly, without Docker — needs `claude`, `gh`, `jq`, `aws`, the Go toolchain and
-`golangci-lint` (>= v2.5.0, `brew install golangci-lint`) on `PATH`. Your
-`~/.claude/settings.json` already supplies the Bedrock wiring, so `MODEL=opus` works here:
-
-```bash
-REPO=/Users/rbz/Projects/ArchUnitGo LOGS=./logs MAX_ISSUES=1 MODEL=opus ./run.sh
-```
-
-`run.log` is the one-line-per-step narration. Everything else in `logs/` is per-invocation detail:
-`N-implement.json` (the full envelope, including `total_cost_usd`), `N-review-1.verdict.json`,
-`N-diff-1.patch`, `N-gate-1.txt`, and `*.debug.log`.
-
-Two of the files in `logs/` are state rather than output, and they are the only state the harness
-keeps outside git and the issues themselves. `skipped` lists the issues abandoned after
-`MAX_ROUNDS` — an issue is taken back off it if a re-attempt lands, because it no longer needs a human
-and both the queue and the retrospective read that file as the answer to whether it does;
-`landed` lists the issues that were implemented but deliberately left open, which
-only happens under `NO_PUSH`. Both are excluded from the queue. Delete them to make the loop
-reconsider an issue — and delete `landed` if you throw away the local commits it refers to,
-or the queue will skip work that is no longer there.
-
-`landed` is pruned at startup of any entry whose issue is no longer open, and that is not tidiness.
-Reopening an issue is how a human says the work was not good enough; a permanent skip entry would make
-that reopened issue invisible to the queue for ever, with the run cheerfully reporting an empty backlog.
-An entry for an issue that is still open is left alone, which is the case the file exists for.
-
-## The retrospective
-
-The critics judge each diff. Nothing judged the *loop* — whether a round was wasted, whether a critic
-that fails everything is pointing at a missing lint rule, whether three passes let something through
-— and that has so far been a human reading `logs/` by hand. `retro.sh` is that pass:
+The critics judge each diff. `retro.sh` judges the *loop* itself — whether a round was wasted, whether a
+critic that fails everything is pointing at a missing lint rule, whether three passes let something
+through.
 
 ```bash
 RETRO=1 MAX_ISSUES=3 ./run.sh     # at the end of the batch
@@ -370,74 +228,104 @@ RETRO=1 MAX_ISSUES=3 ./run.sh     # at the end of the batch
 PACK_ONLY=1 ./retro.sh            # the evidence, without spending anything on the model
 ```
 
-It is worth understanding what it is and is not:
+- It reviews the machinery, not the code — its subject is `prompts/*.md`, `gate.sh` and the round
+  structure.
+- It is cross-issue, which is where the signal is. One issue cannot tell you that the same convention
+  blocked three.
+- The numbers are computed, not summarised — rounds, verdicts, finding counts, gate outcomes and costs
+  come out of the artifacts in bash before the model sees anything. `PACK_ONLY=1` prints exactly what it
+  was given.
+- It is read-only by tool restriction (`Read,Grep,Glob`). It proposes; you decide.
+- It cannot fail the run — it goes last, after the spend line, and its exit status is discarded.
+- "No change needed" is a valid report, and the prompt says so explicitly. One batch of three is an
+  observation, not a trend.
 
-* **It reviews the machinery, not the code.** Its subject is `prompts/*.md`, `gate.sh` and the round
-  structure. The code already had three critics and a gate.
-* **It is cross-issue, which is where the signal is.** "The idiom critic blocked all three issues over
-  the same convention" is an argument for a lint rule in the target repo, paid for once, instead of a
-  judgement bought again on every issue. One issue cannot tell you that.
-* **The numbers are computed, not summarised.** Rounds, verdicts, finding counts, gate outcomes and
-  costs come out of the artifacts in bash before the model sees anything, so the report can be checked
-  against the same files. `PACK_ONLY=1` prints exactly what it was given.
-* **It is read-only by tool restriction**, like the critics — `Read,Grep,Glob`. A pass that edits the
-  prompts it is judging is one nobody can audit, and it would be rewriting files a running loop has
-  open. It proposes; you decide.
-* **It cannot fail the run.** It goes last, after the spend line, and its exit status is discarded. The
-  batch has already landed by then, and a retrospective that crashes must not turn a good night into a
-  failed one.
-* **"No change needed" is a valid report**, and the prompt says so explicitly. Otherwise it invents
-  work to justify itself, which is worse than not running it.
+## Configuration
 
-One batch of three is an observation, not a trend — the prompt is told to say "observed once" rather
-than dress a single instance up as a pattern. It gets more useful the more issues it has to look across.
-
-## Knobs
+### Knobs
 
 All environment variables, all with defaults that work:
 
-| Variable | Default | |
+| Variable | Default | Description |
 |---|---|---|
 | `REPO` | `/work/repo` | Target repository. |
 | `LOGS` | `$HARNESS/logs` | Log directory. |
-| `MAX_ROUNDS` | `3` | *Fix* rounds before an issue is abandoned. The loop runs one more judged round than this, so its last act on an issue is always a gate plus a verdict, never a fix nobody looked at. `MAX_ROUNDS=3` means at most 3 fixes and up to 4 rounds of critics. |
-| `MAX_ISSUES` | `0` | Issues to *attempt*, abandonments included — a bound on what the run touches and what it spends, not on how much of it lands. `0` = run until the queue is empty. Set to `1` for a smoke test. |
+| `MAX_ROUNDS` | `3` | *Fix* rounds before an issue is [abandoned](#abandonment-and-retry). The loop runs one more judged round than this, so its last act on an issue is always a gate plus a verdict, never a fix nobody looked at. `MAX_ROUNDS=3` means at most 3 fixes and up to 4 rounds of critics. |
+| `MAX_ISSUES` | `0` | Issues to *attempt*, abandonments included — a bound on what the run touches and what it spends, not on how much of it lands. `0` = run until the queue is empty. Set to `1` for a [smoke test](#quick-start). |
 | `MAX_CONSECUTIVE_ABANDONS` | `2` | Stop the run after this many issues are abandoned back to back, on the reasoning that a run of abandons is far more often a broken environment than several independently hard issues. `0` = never stop. |
-| `RETRY_ABANDONED` | `1` | Re-attempt each issue this run abandoned, once, after the queue is done — but only if something landed after it, so the re-attempt gets a base the first attempt did not have. Exempt from `MAX_ISSUES`; skipped entirely if the abandon breaker tripped. Empty = off. |
-| `DOUBLE_CRITICS` | `tests` | Roles that run **twice** in round 1, concurrently, with their findings unioned — the second pass told to sweep exhaustively rather than to report what matters most. Aimed at one measured failure: the test critic reporting one of two findings that were both in front of it, at a cost of a full round each time. Empty = every role runs once. |
-| `MAX_SPEND` | `0` | Dollars *this run* may spend before it stops. Checked at issue boundaries only, so the run overshoots by at most one issue rather than ever interrupting one; measured from each invocation's `total_cost_usd`, counting only this run's artifacts. `0` = no cap. |
-| `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. |
+| `RETRY_ABANDONED` | `1` | Re-attempt each issue this run abandoned, once, after the queue is done — but only if something landed after it. Exempt from `MAX_ISSUES`; skipped entirely if the abandon breaker tripped. Empty = off. See [abandonment and retry](#abandonment-and-retry). |
+| `DOUBLE_CRITICS` | `tests` | Roles that run **twice** in round 1, concurrently, with their findings unioned — the second pass told to sweep exhaustively rather than report what matters most. Empty = every role runs once. See [design notes](#design-notes). |
+| `MAX_SPEND` | `0` | Dollars *this run* may spend before it stops. Checked at issue boundaries only; measured from each invocation's `total_cost_usd`, counting only this run's artifacts. `0` = no cap. See [spend cap](#spend-cap). |
+| `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. See [preflight](#preflight). |
 | `NO_PUSH` | unset | Commit locally, but do not push and do not close the issue. Use it for the first run. The issue is recorded in `logs/landed` so the queue still advances. |
 | `TIMEOUT` | `30m` | Wall clock per invocation. |
-| `MODEL` | `global.anthropic.claude-opus-5` | Bedrock model ID. The `opus` alias only resolves via `ANTHROPIC_DEFAULT_OPUS_MODEL`, which the container does not carry. |
-| `FALLBACK_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Used automatically when the primary is overloaded. |
+| `MODEL` | `opencode-go/deepseek-v4-pro` | opencode `provider/model` ID for the reasoning roles — the implementer and the three critics. |
+| `FLASH_MODEL` | `opencode-go/deepseek-v4-flash` | opencode `provider/model` ID for the cheap roles — the fixer and the retrospective. |
 | `MAX_DIFF_BYTES` | `400000` | Diff truncation point for the critics. |
 | `LINT` | `golangci-lint` | The linter binary. Only worth setting to test the fallback path. |
-| `ALLOW_NO_LINT` | unset | Run a Go repo without `golangci-lint` or without a `.golangci.yml`. Downgrades the architecture rules to greps. Do not use for an unattended run. |
+| `ALLOW_NO_LINT` | unset | Run a Go repo without `golangci-lint` or without a `.golangci.yml`. Downgrades the architecture rules to greps. Do not use for an unattended run. See [preflight](#preflight). |
 | `ALLOW_DIRTY` | unset | Start even though the target repo has uncommitted changes, accepting that the first issue's commit will contain them. |
-| `ALLOW_STATIC_CREDS` | unset | Permit an unbounded run on static temporary credentials, which will expire partway through the night. |
-| `RETRO` | unset | Run `retro.sh` on the batch when the run finishes: a report on the harness itself, not on the code. Costs one extra invocation and is only worth it once several issues have been through. |
-| `PACK_ONLY` | unset | `retro.sh` only. Print the evidence pack and exit without calling the model. |
-| `SKIP_MODULE_CHECK` | unset | Skip the preflight module-resolution probe. Worth setting only for an air-gapped run against a settled `go.mod`, where the warning is accurate but not actionable. |
+| `ALLOW_STATIC_CREDS` | unset | Permit an unbounded run on static temporary credentials, which will expire partway through the night. See [authentication](#authentication). |
+| `RETRO` | unset | Run `retro.sh` on the batch when the run finishes: a report on the harness itself, not on the code. Costs one extra invocation and is only worth it once several issues have been through. See [retrospective](#retrospective). |
+| `PACK_ONLY` | unset | `retro.sh` only. Print the evidence pack and exit without calling the model. See [retrospective](#retrospective). |
+| `SKIP_MODULE_CHECK` | unset | Skip the preflight module-resolution probe. Worth setting only for an air-gapped run against a settled `go.mod`, where the warning is accurate but not actionable. See [preflight](#preflight). |
 
-Work up in three steps rather than trusting a fresh container with a night:
+### Authentication
 
-```bash
-./test/loop_test.sh          # the harness itself, with stubbed claude and gh. Costs nothing.
-PREFLIGHT_ONLY=1 ./run.sh    # auth, tools, repo, remote, queue. Costs nothing.
-MAX_ISSUES=1    ./run.sh     # issue #1 end to end. Costs a few dollars.
-```
+Inference goes through **opencode**, which carries its own provider auth. Run `opencode auth login`
+once (it stores a key in `~/.local/share/opencode/auth.json`), or set the provider's `*_API_KEY`
+environment variable. `MODEL` and `FLASH_MODEL` must name a `provider/model` pair that `opencode
+models` lists and that the machine is authenticated for. No `ANTHROPIC_API_KEY` or Bedrock wiring is
+involved.
 
-The last one is the one that tells you whether the prompts, the commit and the push path work.
+`run.sh` checks that opencode is on `PATH` and warns if `opencode auth list` comes back empty — the
+latter is a warning rather than a die, because a key set in the environment may not show up in the list
+until first use, and the first invocation surfaces a real auth failure quickly anyway. Both models are
+checked for in the same breath as the rest of preflight.
 
-## Testing the harness
+A `GH_TOKEN` with `repo` scope is required regardless — the loop reads, comments on and closes issues,
+and pushes commits.
 
-`test/loop_test.sh` runs `run.sh` end to end against a throwaway git repo with `claude` and `gh` stubbed
+> opencode discovers `AGENTS.md` and `CLAUDE.md` in the target repo on its own, so ArchUnitGo's
+> `CLAUDE.md` pointer at `AGENTS.md` is honoured without any flag. The critics run as a read-only agent
+> (`opencode/agents/readonly.md`) whose permissions are deny-on-write, not a prompt request.
+
+### Network egress
+
+Egress needed:
+
+- The provider(s) that `MODEL` and `FLASH_MODEL` name — opencode resolves the endpoint from its
+  provider registry, so this is wherever `opencode auth login` was pointed.
+- `github.com` and `api.github.com` — for `gh`.
+- Go module resolution, depending on `GOPROXY`:
+
+| `GOPROXY` | Needs |
+|---|---|
+| default | `proxy.golang.org` + `sum.golang.org` |
+| `direct` | the VCS host of every dependency — `go.googlesource.com` for `x/tools` — plus `sum.golang.org` |
+
+The default is the narrower and faster of the two, which is why the image does not change it. Use
+`direct` (`-e GOPROXY=direct`) only where `proxy.golang.org` is blocked; its egress set is open-ended.
+
+The image build warms the module cache for `golang.org/x/tools`, so the first gate run does not spend the
+implementer's wall clock fetching it. That reduces the module traffic but **does not remove the need for
+it**: version resolution (`go get ...@latest`, `go mod tidy`) is a network lookup with no cache fallback
+— it fails under `GOPROXY=off` against a fully populated cache. Once the version is pinned in `go.mod`,
+`go build` is offline-capable, but the commit that first adds a dependency still needs `go mod tidy`
+(its own dependencies' checksums).
+
+The image build additionally needs `raw.githubusercontent.com` and `objects.githubusercontent.com` for
+the `golangci-lint` installer, plus whatever `GOPROXY` resolves to for the cache warm — pass
+`--build-arg GOPROXY=direct` if the build host is the blocked one. Neither is needed at run time.
+
+## Testing
+
+`test/loop_test.sh` runs `run.sh` end to end against a throwaway git repo with `opencode` and `gh` stubbed
 out on `PATH`. No model, no network, no spend, a couple of seconds.
 
-It exists because the paths that matter most are the ones a real run almost never takes. Issue #1 went
+It exists because the paths that matter most are the ones a real run almost never takes — issue #1 went
 through with both critics passing on the first round, which validated exactly none of the review
-machinery. The scenarios are:
+machinery. The scenarios:
 
 | Scenario | What it pins down |
 |---|---|
@@ -470,10 +358,12 @@ machinery. The scenarios are:
 KEEP=1 ./test/loop_test.sh abandon  # leave the temp repo behind to poke at
 ```
 
-The stubs are in `test/stub/`. `claude` works out which invocation it is from the `--debug-file` path —
+The stubs are in `test/stub/`. `opencode` works out which invocation it is from the `--title` argument —
 the only place `run.sh` puts the tag on the command line — captures its stdin so the test can assert on
-what the harness actually put in each prompt, and edits the working tree so the diff is non-empty.
-`timeout` is a shim: it is coreutils, present in the image but not on a stock macOS box.
+what the harness actually put in each prompt, and edits the working tree so the diff is non-empty. It
+emits the same ndjson stream `opencode run --format json` does, so run.sh's real envelope synthesis is
+what the suite exercises. `timeout` is a shim: it is coreutils, present in the image but not on a stock
+macOS box.
 
 ## Cost
 
@@ -484,20 +374,128 @@ order of a few dollars per issue, and the run prints the total from the JSON env
 **There is deliberately no per-invocation spend cap.** There was one (`--max-budget-usd`) and it was
 removed: an invocation that hits a cap is killed mid-edit, which for the implementer means a half-written
 package that the gate then rejects, and for a critic means no verdict at all — the fail-closed path turns
-that into a `FAIL` and burns a round on a finding nobody wrote. A truncated round costs more than the
-tokens it saved. `TIMEOUT` is the remaining stop, and a wall clock is the honest one: it bounds a *wedged*
-invocation without punishing an expensive but productive one. Watch the first two or three issues before
-walking away.
+that into a `FAIL` and burns a round on a finding nobody wrote. `TIMEOUT` is the remaining stop: it
+bounds a *wedged* invocation without punishing an expensive but productive one. Watch the first two or
+three issues before walking away.
 
-## Known limits
+## Limitations
 
-- **Sequential by design.** The issues are numbered in dependency order — #16 is meaningless without
-  #1 — so parallel implementers would conflict and build against a kernel that does not exist yet.
+- **Sequential by design.** The issues are numbered in dependency order — #16 is meaningless without #1 —
+  so parallel implementers would conflict and build against a kernel that does not exist yet.
 - **Some issues are bigger than one sitting.** "Metrics: the LCOM family" and "Graph reports: the six
   output formats" are days of work. Expect a shallow first pass; the implementer is told to build the
   smallest coherent whole rather than a scaffold of stubs.
 - **Large diffs are truncated** before the critics see them, and the truncation is logged as a warning
   rather than silently applied.
-- **`--dangerously-skip-permissions` means what it says.** Claude can change anything in the mounted
-  workspace and reach anything the container's network policy allows. Mount only the target repo, and
-  put an egress policy on the container if the host has anything else worth reaching.
+- **The implementer runs with full tool access.** opencode can change anything in the mounted
+  workspace and reach anything the container's network policy allows. Mount only the target repo, and put
+  an egress policy on the container if the host has anything else worth reaching.
+
+## Design notes
+
+Why the loop is shaped the way it is, one idea per line — punchline first.
+
+### The gate runs before the reviewers
+
+- **No model tokens are ever spent reviewing code that does not compile.** `gate.sh` runs the full check
+  suite before any reviewer sees the diff, and a gate failure does not consume a review round.
+
+### Architecture rules live in the target repo
+
+- **They are `depguard` rules over the *resolved* import graph, not `grep`s over import lines.** An
+  aliased, blank or line-wrapped import cannot slip past them — and the implementer can run exactly the
+  check the gate will run. `AGENTS.md`'s dependency rules 1–3, the purity rule for
+  `assertion`/`projection`/`calculation`, "globs compile to regex in one place" and the doc-comment rules
+  are all expressed there.
+- **Rule 4 (*nothing imports the root package*) is the one `depguard` structurally cannot express** —
+  it matches path prefixes and the public surface's path is the module path itself — so the idiom critic
+  owns that one by hand.
+
+### Moving checks out of the prompts makes the critics useful
+
+- **Both critic prompts open with the list of what the toolchain has already proven, and an instruction
+  not to report any of it.** A critic spending its round on a missing doc comment is a round not spent on
+  the things no linter can see — e.g. a value-receiver builder doing `append(b.xs, x)` without a clone,
+  which compiles, passes every linter, passes single-branch tests, and silently corrupts one branch of a
+  half-built rule whenever `cap > len`.
+
+### The three critics do not overlap
+
+- **Keeping them disjoint is the whole design.** All three are told to return `PASS` when their only
+  findings are cosmetic — which stops the idiom critic becoming a rename generator that never approves.
+  Each round, only the critics that actually found something contribute a section to the fixer's prompt.
+- **The critics run concurrently**, so a third reviewer costs about a dollar a round and no wall clock.
+
+### The test critic exists because the other two demonstrably missed this defect class
+
+- **Issue #2:** both returned `PASS` with no findings, and the diff contained a `TestFiltersAreImmutable`
+  that passed against a `Filter.Excluding` with its `slices.Clone` deleted — it asserted only that the
+  *parent* was unchanged, which is true even with the bug, because appending to a nil slice always
+  allocates. The test critic found it, plus a second gap nobody had noticed: the separator normalisation
+  in `Filter.Matches` could be deleted with the whole suite still green, because `Pattern.Matches`
+  normalises a second time and no Filter-level test ever passed a backslash. Both confirmed by mutating
+  the code and re-running.
+- **Issue #5 (first live run):** `WithDefaults` returned a bare `*o`, leaving `BuildTags` pointing at the
+  caller's backing array. The reviewer and idiom critic passed it every round. The test critic blocked on
+  the test instead of the code: the aliasing test only asserted the caller was unchanged, and the one
+  field where copying is a real decision was never touched. The fix was `slices.Clone`. Three instances
+  of that bug class so far, and this critic has caught all three.
+- **Report everything in one pass.** Issue #5's round-2 verdict said the test never asserted that the
+  resolved copy *carries* the caller's values, so `WithDefaults` dropping four of six fields was
+  undetectable — equally true of the round-1 test. All three prompts now say to report everything
+  blocking in one pass, because a held-back finding is a round the issue may not have.
+
+### Round 1 doubles the test critic
+
+- **Telling it to report everything is not the same as it doing it** — #26 still spent a round on the
+  same shape of thing. So the roles in `DOUBLE_CRITICS` (test critic, by default) run twice in round 1,
+  concurrently, findings unioned.
+- **The two passes are not copies.** The second is told another instance is already reporting whatever it
+  considers most important, and its own job is the opposite — walk the changed files and name *every*
+  instance, because a finding held back for being smaller than another is a finding nobody makes.
+- **Round 1 only, because the marginal round is where completeness is worth paying for** — a round-1
+  finding costs a fix round; a round-3 finding costs a fix round *and* the two rounds already spent. The
+  union lands at the canonical `$TAG-$role-$round.verdict.json` (`FAIL` if either pass failed), so the
+  unanimity check, the fixer's prompt and `retro.sh`'s round table are unchanged; each pass's own verdict
+  stays on disk as evidence. At about a dollar a pass, concurrent, it costs no wall clock and less than a
+  fifth of the round it is trying to avoid.
+- **The prompt is built on one mechanism — name the mutation.** For every test, state the one-line change
+  that makes it fail; if you cannot, the test asserts nothing and that is a block. It is forbidden from
+  reporting coverage percentages (there is no threshold in the gate) or asking for a test without naming
+  what would break.
+
+### The gate hunts reward hacking
+
+- **The cheapest way to make `go test` pass is to stop running the tests.** `gate.sh` fails on `t.Skip`
+  (unless the line carries an `ALLOW-SKIP: <reason>`), on a commented-out test function, on a module with
+  no tests, and on **a test-function count lower than at the base commit** — the one thing coverage
+  cannot tell you, because a deleted test takes its uncovered lines with it. `errcheck` with
+  `check-blank` covers `_ =`, and `go vet`/`SA4011` cover `if false`. Both critics treat a weakened check
+  as always blocking, and the fixer is told that weakening `.golangci.yml` counts as weakening the checks.
+- **A test that cannot fail is the same defect wearing a passing suite.** The gate requires every
+  `const Kind... = "literal"` to have its *string value* asserted by a literal somewhere in the tests.
+  Comparing `Kind()` against the constant is a tautology — respell the constant and the suite stays green,
+  including onto a collision with a sibling kind. The test critic found precisely this on #21, at a cost
+  of $5.05 of critics and fixer, to report and fix something a `grep` decides for nothing.
+- **The kind-pinning check is base-relative**, like the test count: `KindFileDependency` landed unpinned
+  in #20 with all three critics passing, so a check that failed on the tree's existing holes would hand
+  the next implementer somebody else's work. Forbidden is *adding* one; what is already unpinned is
+  reported pre-existing and passes. Verified against real history before it shipped.
+
+### Why abandoned issues get one retry
+
+- **An abandonment leaves a hole in a dependency-ordered queue.** #21 (an unimplemented Files API
+  terminal) was abandoned, #22–#26 landed over it, and the batch finished with five commits of kernel
+  above a gap that the abandoned issue had been the prerequisite for. Hence the one re-attempt on the
+  final tree.
+- **The re-attempt is handed the loop's best evidence about where the issue is hard** — the findings
+  still outstanding when the first attempt was abandoned — rather than starting from the issue text
+  alone, which would leave that evidence on a branch nobody reads.
+
+### Spend is bounded in dollars, not issues
+
+- **Issues do not cost the same** — one lands in two rounds for $8, the next takes six rounds for $60, so
+  a count has no ceiling anyone can state in advance (18 issues is somewhere between $150 and $1,000).
+- **The cap bounds what the run *starts***, and overshooting by up to one issue is the price of never
+  abandoning work mid-flight. Spend is summed from each invocation's `total_cost_usd`, counting only
+  files newer than a marker touched at startup.

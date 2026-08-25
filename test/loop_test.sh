@@ -175,7 +175,7 @@ scenario_garbage() {
   run_loop garbage MAX_ISSUES=1
 
   want "$RC" "exits 0"
-  want_grep "no structured output — failing closed" "$ROOT/run.out" "the unparseable verdict failed closed"
+  want_grep "no verdict in the output — failing closed" "$ROOT/run.out" "the unparseable verdict failed closed"
   want_grep "did not return a verdict" "$STUB_DIR/2-fix-1.stdin" \
             "the synthesised finding reached the fixer"
   want_grep "round 2: all 3 critics PASS" "$ROOT/run.out" "round 2 recovered"

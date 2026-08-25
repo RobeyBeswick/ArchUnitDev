@@ -26,15 +26,15 @@ REPO="${REPO:-/work/repo}"
 MAX_ROUNDS="${MAX_ROUNDS:-3}"
 CRITICS=(review idiom tests)
 TIMEOUT="${TIMEOUT:-30m}"
-MODEL="${MODEL:-global.anthropic.claude-opus-5}"
-FALLBACK_MODEL="${FALLBACK_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
+MODEL="${MODEL:-opencode-go/deepseek-v4-flash}"
 STAMP="$(date -u '+%Y%m%dT%H%M%SZ')"
 OUT="${OUT:-$LOGS/retro-$STAMP.md}"
 
 say() { printf '%s  %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$LOGS/run.log"; }
 
-command -v claude >/dev/null || { say "retro: claude not on PATH"; exit 1; }
+command -v opencode >/dev/null || { say "retro: opencode not on PATH"; exit 1; }
 command -v jq     >/dev/null || { say "retro: jq not on PATH"; exit 1; }
+export OPENCODE_CONFIG_DIR="$HARNESS/opencode"
 
 # The subject. Given explicitly, or every issue this log directory holds an implementer run for —
 # which on a long-lived log directory is *every batch ever run into it*, not just the last one. That
@@ -149,32 +149,33 @@ fi
 
 say "retro: reviewing issue(s) ${ISSUES[*]} — pack is $(wc -c < "$pack" | tr -d ' ') bytes"
 
-# --add-dir, because the artifacts are in LOGS and the code is in REPO: two directories, and the
-# retrospective needs to read across both to tell "the critics missed this" from "the issue never
-# asked for it". GH_TOKEN is stripped for the same reason it is stripped from every other model
-# invocation — nothing here has any business closing an issue or pushing.
-add_dirs=("--add-dir" "$LOGS")
-[ -d "$REPO" ] && add_dirs+=("--add-dir" "$REPO")
+# The retrospective reads across LOGS and REPO — two directories — which the read-only agent can do
+# because external_directory is left allowed on it. GH_TOKEN is stripped for the same reason it is
+# stripped from every other model invocation: nothing here has any business closing an issue or pushing.
 timeout_cmd=()
 command -v timeout >/dev/null && timeout_cmd=(timeout "$TIMEOUT")
 
 { cat "$HARNESS/prompts/retro.md"; printf '\n---\n\n'; cat "$pack"; } \
   | env -u GH_TOKEN -u GITHUB_TOKEN \
-    ${timeout_cmd[@]+"${timeout_cmd[@]}"} claude -p \
+    ${timeout_cmd[@]+"${timeout_cmd[@]}"} opencode run \
+      --format json \
       --model "$MODEL" \
-      --fallback-model "$FALLBACK_MODEL" \
-      --output-format json \
-      --tools "Read,Grep,Glob" \
-      "${add_dirs[@]}" \
-      --dangerously-skip-permissions \
-      --no-session-persistence \
-      --debug-file "$LOGS/retro-$STAMP.debug.log" \
-      > "$LOGS/retro-$STAMP.json" 2>>"$LOGS/run.log"
+      --agent readonly \
+      --dir "$REPO" \
+      --title "retro-$STAMP" \
+      > "$LOGS/retro-$STAMP.jsonl" 2>>"$LOGS/run.log"
 rc=$?
+
+# The same synthesis as run.sh: the report is the last text part, the cost the sum of the steps.
+jq -s '{
+    type: "result", subtype: "success", is_error: false,
+    result: ([.[] | select(.type=="text") | .part.text // empty] | last // ""),
+    total_cost_usd: ([.[] | select(.type=="step_finish") | .part.cost // 0] | add // 0)
+  }' "$LOGS/retro-$STAMP.jsonl" > "$LOGS/retro-$STAMP.json"
 
 report=$(jq -r '.result // empty' "$LOGS/retro-$STAMP.json" 2>/dev/null)
 if [ -z "$report" ]; then
-  say "retro: no report came back (rc=$rc) — see retro-$STAMP.json and retro-$STAMP.debug.log"
+  say "retro: no report came back (rc=$rc) — see retro-$STAMP.json and retro-$STAMP.jsonl"
   exit 1
 fi
 printf '%s\n' "$report" > "$OUT"

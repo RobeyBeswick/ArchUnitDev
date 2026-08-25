@@ -36,11 +36,11 @@ MAX_ROUNDS="${MAX_ROUNDS:-3}"       # review/fix rounds before an issue is aband
 CRITICS=(review idiom tests)
 MAX_ISSUES="${MAX_ISSUES:-0}"       # 0 = run until the queue is empty
 TIMEOUT="${TIMEOUT:-30m}"           # wall clock per invocation
-# Bedrock model IDs, not the "opus"/"sonnet" aliases: the aliases only resolve via
-# ANTHROPIC_DEFAULT_*_MODEL, which lives in the host's ~/.claude/settings.json and is
-# deliberately not carried into the container.
-MODEL="${MODEL:-global.anthropic.claude-opus-5}"
-FALLBACK_MODEL="${FALLBACK_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
+# opencode provider/model IDs. The reasoning roles — implementer and the three critics — take MODEL;
+# the fixer and the retrospective take FLASH_MODEL, where cheap is good enough. Both must name a
+# provider/model that `opencode models` lists and that the machine is authenticated for.
+MODEL="${MODEL:-opencode-go/deepseek-v4-pro}"
+FLASH_MODEL="${FLASH_MODEL:-opencode-go/deepseek-v4-flash}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-400000}"
 NO_PUSH="${NO_PUSH:-}"              # set to 1 to commit locally but not push or close issues
 MAX_CONSECUTIVE_ABANDONS="${MAX_CONSECUTIVE_ABANDONS:-2}"   # stop the run after this many in a row; 0 = never stop
@@ -62,6 +62,10 @@ MAX_SPEND="${MAX_SPEND:-0}"         # dollars this run may spend before it stops
 DOUBLE_CRITICS="${DOUBLE_CRITICS-tests}"  # roles that run twice in round 1, findings unioned; empty = none
 
 SCHEMA="$(cat "$HARNESS/schema/verdict.json")"
+# The read-only agent the critics and the retrospective run as. Its permissions (read/grep/glob only)
+# are what make "read-only by tool restriction" true; the prompts ask for the same thing, but a prompt
+# is a request and this is not. opencode finds agents under $OPENCODE_CONFIG_DIR/agents/.
+export OPENCODE_CONFIG_DIR="$HARNESS/opencode"
 SKIPPED="$LOGS/skipped"          # abandoned: got no further after MAX_ROUNDS, needs a human
 LANDED="$LOGS/landed"            # landed but deliberately left open, which only NO_PUSH does
 
@@ -148,8 +152,8 @@ spend_all_time() {
 # --- preflight -------------------------------------------------------------------
 # Every check here is something that otherwise fails silently or halfway through the night.
 
-[ "$(id -u)" -ne 0 ] || die "refusing to run as root: Claude Code blocks --dangerously-skip-permissions for the root user. Run the container as a non-root user."
-command -v claude >/dev/null || die "claude not on PATH"
+[ "$(id -u)" -ne 0 ] || die "refusing to run as root — run the container as a non-root user"
+command -v opencode >/dev/null || die "opencode not on PATH"
 command -v gh     >/dev/null || die "gh not on PATH"
 command -v jq     >/dev/null || die "jq not on PATH"
 command -v go     >/dev/null || say "WARNING: go not on PATH — the build and test gate will be skipped"
@@ -223,45 +227,13 @@ if [ -f "$REPO/go.mod" ] && command -v go >/dev/null 2>&1 && [ -z "${SKIP_MODULE
   fi
 fi
 
-# Auth. Three ways in; check the one actually configured, and fail now rather than on
-# the first invocation an hour into the night.
-if [ "${CLAUDE_CODE_USE_BEDROCK:-}" = "1" ]; then
-  command -v aws >/dev/null || die "CLAUDE_CODE_USE_BEDROCK=1 but the aws CLI is not installed, so credentials cannot be verified"
-  # The trap: an AWS_PROFILE that resolves on the host and cannot resolve in here. Both shapes of it
-  # fail the same misleading way — the SDK reports no credentials, so the log reads as a missing role
-  # rather than as an inherited variable — and in both, unsetting it lets the instance profile answer.
-  # The helper is read out of the config rather than hardcoded, so this holds for whichever one is in
-  # use, and the profile-not-found arm is what catches a container that got AWS_PROFILE through `-e`
-  # without the config file that defines it.
-  if [ -n "${AWS_PROFILE:-}" ]; then
-    # `| awk` and not `| grep -q`: awk drains its input, so pipefail cannot report the writer's
-    # SIGPIPE instead of the result. See the test that bans the other shape.
-    helper=$(aws configure get credential_process --profile "$AWS_PROFILE" 2>/dev/null | awk 'NR==1 {print $1}')
-    profiles=$(aws configure list-profiles 2>/dev/null)
-    if [ -n "$helper" ] && ! command -v "$helper" >/dev/null 2>&1; then
-      say "WARNING: AWS_PROFILE=$AWS_PROFILE resolves credentials by running '$helper', which is not on PATH here — they cannot resolve. Unset AWS_PROFILE to fall back to the EC2 instance profile."
-    else
-      case $'\n'"$profiles"$'\n' in
-        *$'\n'"$AWS_PROFILE"$'\n'*) : ;;
-        *) say "WARNING: AWS_PROFILE=$AWS_PROFILE is set but no such profile exists here — the SDK fails on a named profile it cannot find rather than falling through to the instance profile. Unset AWS_PROFILE." ;;
-      esac
-    fi
-  fi
-  caller=$(aws sts get-caller-identity --query Arn --output text 2>&1) \
-    || die "CLAUDE_CODE_USE_BEDROCK=1 but no usable AWS credentials: $caller"
-  say "auth: Bedrock in ${AWS_REGION:-${AWS_DEFAULT_REGION:-unset-region}} as $caller"
-  # Static creds in the environment do not refresh. Fine for a bounded smoke test; for an
-  # unbounded run they die partway through the night, so that needs saying out loud.
-  if [ -n "${AWS_SESSION_TOKEN:-}" ] && [ -z "${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI:-}" ]; then
-    if [ "$MAX_ISSUES" -eq 0 ] && [ -z "${ALLOW_STATIC_CREDS:-}" ]; then
-      die "refusing an unbounded run on static temporary credentials — they will expire partway through and every invocation after that fails. Use an EC2 instance profile, or set MAX_ISSUES to something that finishes inside their lifetime, or set ALLOW_STATIC_CREDS=1 to override."
-    fi
-    say "WARNING: static temporary credentials — these will NOT refresh. Fine for MAX_ISSUES=$MAX_ISSUES, not for a full run."
-  fi
-elif [ -n "${ANTHROPIC_API_KEY:-}${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-  say "auth: Anthropic API"
-else
-  die "no auth configured: set CLAUDE_CODE_USE_BEDROCK=1 with AWS credentials, or ANTHROPIC_API_KEY, or CLAUDE_CODE_OAUTH_TOKEN"
+# Auth lives inside opencode (opencode auth login, stored in ~/.local/share/opencode/auth.json, or a
+# provider *_API_KEY env var). An empty auth list is a warning rather than a die: keys set in the
+# environment may not show up in the list until first use, and the first invocation surfaces a real
+# failure quickly anyway. The one thing worth dying on early is that MODEL and FLASH_MODEL name a
+# provider the machine has credentials for — checked here, cheaply, before any issue is paid for.
+if ! opencode auth list >/dev/null 2>&1; then
+  say "WARNING: 'opencode auth list' failed — is a provider configured? Run 'opencode auth login'."
 fi
 
 cd "$REPO" || die "cannot cd to $REPO"
@@ -356,7 +328,7 @@ if [ -s "$LANDED" ]; then
 fi
 
 say "harness $HARNESS -> repo $REPO ($(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD))"
-say "model $MODEL (fallback $FALLBACK_MODEL), $MAX_ROUNDS rounds/issue, $TIMEOUT per invocation, $([ "$MAX_SPEND" = 0 ] && echo "no spend cap" || echo "\$$MAX_SPEND spend cap")"
+say "model $MODEL (implement/critics), $FLASH_MODEL (fix/retro), $MAX_ROUNDS rounds/issue, $TIMEOUT per invocation, $([ "$MAX_SPEND" = 0 ] && echo "no spend cap" || echo "\$$MAX_SPEND spend cap")"
 say "queue: $(gh issue list --state open --limit 300 --json number --jq 'length') open issue(s)"
 
 # PREFLIGHT_ONLY=1 verifies the wiring — auth, tools, repo, remote, queue — and spends nothing.
@@ -368,56 +340,86 @@ fi
 
 # --- the two kinds of invocation -------------------------------------------------
 
-# work <tag>   : full tool access, edits the repo. Prompt on stdin.
+# opencode emits one JSON object per line (ndjson): step_start, text, tool_use, step_finish. The rest
+# of the harness reads a single envelope, so synthesize one after each run. The last text part is the
+# result; the sum of the step_finish costs is total_cost_usd; turns and the terminal reason come from
+# the final step. The raw stream is kept beside the envelope as $tag.jsonl for debugging.
+oc_synth() {
+  # $1 = raw ndjson file, $2 = tag. Writes $LOGS/$2.json.
+  local raw="$1" tag="$2"
+  jq -s '{
+      type: "result", subtype: "success", is_error: false,
+      result: ([.[] | select(.type=="text") | .part.text // empty] | last // ""),
+      total_cost_usd: ([.[] | select(.type=="step_finish") | .part.cost // 0] | add // 0),
+      num_turns: ([.[] | select(.type=="step_finish")] | length),
+      terminal_reason: ([.[] | select(.type=="step_finish") | .part.reason // "?"] | last // "?")
+    }' "$raw" > "$LOGS/$tag.json"
+}
+
+# oc_verdict <text> : emit {verdict, findings[]} if the text holds a parseable verdict, else fail.
+# opencode's run mode has no native JSON-schema enforcement, so the verdict is read out of the model's
+# text and validated here; a critic that did not answer in JSON fails closed, exactly like a crash.
+oc_verdict() {
+  local raw="$1" obj
+  if printf '%s' "$raw" | jq -e '.verdict | type == "string"' >/dev/null 2>&1; then
+    printf '%s' "$raw" | jq -c '{verdict: .verdict, findings: ((.findings // []) | if type == "array" then . else [] end)}'
+    return 0
+  fi
+  obj=$(printf '%s' "$raw" | grep -oE '\{.*\}' | tail -1)
+  if [ -n "$obj" ] && printf '%s' "$obj" | jq -e '.verdict | type == "string"' >/dev/null 2>&1; then
+    printf '%s' "$obj" | jq -c '{verdict: .verdict, findings: ((.findings // []) | if type == "array" then . else [] end)}'
+    return 0
+  fi
+  return 1
+}
+
+# work <tag> [model] : full tool access, edits the repo. Prompt on stdin.
 #
 # GH_TOKEN is stripped from the environment. The prompts tell the implementer not to push or
 # close issues, but a prompt is a request; with no token and no ~/.config/gh in the image,
 # `gh` cannot authenticate and `git push` over HTTPS has no credential — so it is enforced.
-# Only the harness holds the token. AWS credentials stay: Bedrock inference needs them.
+# Only the harness holds the token.
 work() {
-  local tag="$1"
+  local tag="$1" model="${2:-$MODEL}"
   # The +expansion guard is not decoration: bash 3.2, which is what macOS ships, treats
   # "${arr[@]}" on an empty array as an unbound variable under `set -u`.
   env -u GH_TOKEN -u GITHUB_TOKEN \
-  ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} claude -p \
-    --model "$MODEL" \
-    --fallback-model "$FALLBACK_MODEL" \
-    --output-format json \
-    --no-session-persistence \
-    --dangerously-skip-permissions \
-    --debug-file "$LOGS/$tag.debug.log" \
-    > "$LOGS/$tag.json" 2>>"$LOGS/run.log"
+  ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} opencode run \
+    --format json \
+    --model "$model" \
+    --auto \
+    --dir "$REPO" \
+    --title "$tag" \
+    > "$LOGS/$tag.jsonl" 2>>"$LOGS/run.log"
   local rc=$?
+  oc_synth "$LOGS/$tag.jsonl" "$tag"
   jq -r '.result // "(no result)"' "$LOGS/$tag.json" > "$LOGS/$tag.txt" 2>/dev/null
   say "  $tag: rc=$rc cost=\$$(jq -r '.total_cost_usd // 0' "$LOGS/$tag.json" 2>/dev/null) turns=$(jq -r '.num_turns // 0' "$LOGS/$tag.json" 2>/dev/null) reason=$(jq -r '.terminal_reason // "?"' "$LOGS/$tag.json" 2>/dev/null)"
   return $rc
 }
 
-# critic <tag> <verdict-out> : read-only by tool restriction, returns validated JSON. Prompt on stdin.
+# critic <tag> <verdict-out> : read-only (the `readonly` agent), returns a JSON verdict. Prompt on stdin.
 # Fails closed — a crashed or truncated critic is a FAIL, never a silent PASS.
 critic() {
   local tag="$1" out="$2"
   # The +expansion guard is not decoration: bash 3.2, which is what macOS ships, treats
   # "${arr[@]}" on an empty array as an unbound variable under `set -u`.
   env -u GH_TOKEN -u GITHUB_TOKEN \
-  ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} claude -p \
+  ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} opencode run \
+    --format json \
     --model "$MODEL" \
-    --fallback-model "$FALLBACK_MODEL" \
-    --output-format json \
-    --json-schema "$SCHEMA" \
-    --tools "Read,Grep,Glob" \
-    --dangerously-skip-permissions \
-    --no-session-persistence \
-    --debug-file "$LOGS/$tag.debug.log" \
-    > "$LOGS/$tag.json" 2>>"$LOGS/run.log"
+    --agent readonly \
+    --dir "$REPO" \
+    --title "$tag" \
+    > "$LOGS/$tag.jsonl" 2>>"$LOGS/run.log"
+  oc_synth "$LOGS/$tag.jsonl" "$tag"
 
-  if ! jq -e '.structured_output.verdict' "$LOGS/$tag.json" >/dev/null 2>&1; then
-    say "  $tag: no structured output — failing closed"
+  if ! oc_verdict "$(jq -r '.result // ""' "$LOGS/$tag.json")" > "$out" 2>/dev/null; then
+    say "  $tag: no verdict in the output — failing closed"
     printf '{"verdict":"FAIL","findings":[{"file":"-","problem":"The %s invocation did not return a verdict (crash or timeout).","fix":"Re-run; if it repeats, the diff is probably too large to review in one pass."}]}\n' "$tag" > "$out"
-    return 0
   fi
-  jq '.structured_output' "$LOGS/$tag.json" > "$out"
   say "  $tag: $(jq -r .verdict "$out") ($(jq -r '.findings|length' "$out") findings) cost=\$$(jq -r '.total_cost_usd // 0' "$LOGS/$tag.json")"
+  return 0
 }
 
 # critic_name <role> : what the fixer sees the findings attributed to
@@ -491,17 +493,11 @@ while :; do
     fi
   fi
 
-  # Two circuit breakers, both aimed at the same failure: the environment breaks partway through a
-  # long queue and the loop keeps going, abandoning every remaining issue for a reason that has
-  # nothing to do with the issue. Each abandonment costs an implement invocation, MAX_ROUNDS fix
-  # invocations and every critic in between, and leaves a needs-human label on work nobody has
-  # looked at. Stopping is recoverable; a queue of spurious abandonments is not.
-  if [ "$attempted" -gt 0 ] && [ "${CLAUDE_CODE_USE_BEDROCK:-}" = "1" ]; then
-    # Credentials are the likeliest thing to go: a role session expires mid-run, every invocation
-    # after it fails, and every critic fails closed into a FAIL. One free API call rules it out.
-    aws sts get-caller-identity >/dev/null 2>&1 \
-      || die "AWS credentials stopped resolving after $attempted issue(s) — stopping before the rest of the queue is abandoned over it. Refresh them and run again; the queue picks up from the issues still open."
-  fi
+  # A circuit breaker aimed at one failure: the environment breaks partway through a long queue and
+  # the loop keeps going, abandoning every remaining issue for a reason that has nothing to do with
+  # the issue. Each abandonment costs an implement invocation, MAX_ROUNDS fix invocations and every
+  # critic in between, and leaves a needs-human label on work nobody has looked at. Stopping is
+  # recoverable; a queue of spurious abandonments is not.
   if [ "$MAX_CONSECUTIVE_ABANDONS" -gt 0 ] && [ "$consecutive_abandons" -ge "$MAX_CONSECUTIVE_ABANDONS" ]; then
     die "$consecutive_abandons issue(s) abandoned in a row — stopping. That is far more often a broken environment (expired credentials, a wedged toolchain, a model outage, a missing dependency every issue needs) than several independently hard issues. The work is parked on branches and the numbers are in $(basename "$SKIPPED"); set MAX_CONSECUTIVE_ABANDONS=0 to run through them anyway."
   fi
@@ -636,7 +632,7 @@ while :; do
     echo "## Issue #$N: $TITLE"; echo
     cat "$LOGS/issue-$N.md"
     [ -s "$carry" ] && { echo; cat "$carry"; }
-  } | work "$TAG-implement"
+  } | work "$TAG-implement" "$MODEL"
 
   approved=0
   # Why the round loop stopped, when it stopped for a reason other than running out of rounds. It
@@ -672,7 +668,7 @@ while :; do
       { cat "$HARNESS/prompts/fix.md"
         echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo
         echo "## Failing checks"; echo '```'; cat "$LOGS/$TAG-gate-$round.txt"; echo '```'
-      } | work "$TAG-fix-$round"
+      } | work "$TAG-fix-$round" "$FLASH_MODEL"
       continue
     fi
     say "  round $round: gate clean"
@@ -726,6 +722,13 @@ SWEEP
           echo "## What the implementer says it did"; echo; cat "$LOGS/$TAG-implement.txt"; echo
           echo "## The diff under review (since $BASE)"; echo '```diff'
           head -c "$MAX_DIFF_BYTES" "$LOGS/$TAG-diff-$round.patch"; echo '```'
+          echo
+          echo "## Output format"
+          echo
+          echo "Respond with a single JSON object matching this schema, and nothing else — no prose before or"
+          echo "after it, no markdown fences. If the object is not valid JSON, the run treats it as a FAIL:"
+          echo
+          cat "$HARNESS/schema/verdict.json"
         } | critic "$ctag" "$LOGS/$ctag.verdict.json" &
       done
     done
@@ -775,7 +778,7 @@ SWEEP
         echo "## Blocking findings — $(critic_name "$role")"; echo
         findings_text "$LOGS/$TAG-$role-$round.verdict.json"; echo
       done
-    } | work "$TAG-fix-$round"
+    } | work "$TAG-fix-$round" "$FLASH_MODEL"
   done
 
   # --- land it, or hand it to a human ---
@@ -901,8 +904,8 @@ say "spend: \$$(spend_this_run) this run; \$$(spend_all_time) in $(basename "$LO
 # crashes must not turn a successful night into a failed one — and it must not be able to change the
 # exit status a caller reads to decide whether the batch worked.
 if [ -n "${RETRO:-}" ] && [ "${#attempted_issues[@]}" -gt 0 ]; then
-  REPO="$REPO" LOGS="$LOGS" MAX_ROUNDS="$MAX_ROUNDS" MODEL="$MODEL" \
-    FALLBACK_MODEL="$FALLBACK_MODEL" TIMEOUT="$TIMEOUT" \
+  REPO="$REPO" LOGS="$LOGS" MAX_ROUNDS="$MAX_ROUNDS" MODEL="$FLASH_MODEL" \
+    TIMEOUT="$TIMEOUT" \
     "$HARNESS/retro.sh" "${attempted_issues[@]}" \
     || say "retro: failed — the batch above is unaffected"
 fi

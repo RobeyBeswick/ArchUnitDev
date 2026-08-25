@@ -1,7 +1,7 @@
 # Runner image for the ArchUnitDev loop.
 #
-# Deliberately non-root: Claude Code refuses to start with --dangerously-skip-permissions
-# when running as root, and the loop depends on never blocking for a permission prompt.
+# Deliberately non-root: the loop runs an unattended agent with full tool access against a mounted
+# repo, and a non-root user is the one thing bounding the damage a bad edit can do outside the mount.
 FROM golang:1-bookworm
 
 ARG GH_VERSION=2.65.0
@@ -43,8 +43,8 @@ RUN useradd -m -u "${UID}" dev && mkdir -p /work && chown dev:dev /work
 USER dev
 ENV HOME=/home/dev
 
-RUN curl -fsSL https://claude.ai/install.sh | bash
-ENV PATH="/home/dev/.local/bin:${PATH}"
+RUN curl -fsSL https://opencode.ai/install | bash
+ENV PATH="/home/dev/.opencode/bin:${PATH}"
 
 # safe.directory matters: the target repo is bind-mounted and will not be owned by dev.
 #
@@ -96,14 +96,6 @@ COPY --chown=dev:dev . /harness
 WORKDIR /harness
 
 ENV REPO=/work/repo \
-    LOGS=/work/logs \
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-
-# Inference goes through Bedrock. AWS_PROFILE is deliberately NOT set: a host profile that
-# resolves credentials through a `credential_process` names a helper binary, and that binary
-# does not exist in here. With it unset, the SDK credential chain falls through to the EC2
-# instance profile, which refreshes itself and so survives a full overnight run.
-ENV CLAUDE_CODE_USE_BEDROCK=1 \
-    AWS_REGION=us-east-1
+    LOGS=/work/logs
 
 ENTRYPOINT ["/harness/run.sh"]
