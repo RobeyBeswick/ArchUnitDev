@@ -30,9 +30,17 @@ mkdir -p "$LOGS" 2>/dev/null || { echo "FATAL: cannot create LOGS=$LOGS" >&2; ex
 LOGS="$(cd "$LOGS" && pwd)"
 [ -d "$REPO" ] && REPO="$(cd "$REPO" && pwd)"
 
+# Which language stack the target repo is. Selects the deterministic gate (gate/$TARGET_LANG.sh) and
+# the prompt set (prompts/$TARGET_LANG/). Named TARGET_LANG and not LANG, because LANG is the POSIX
+# locale variable and is set on real hosts and in images — reading it as a toolchain would yield
+# "en_US.UTF-8" and fail preflight. A language is added by writing its gate script and its prompts;
+# the loop below does not know or care which one is running.
+TARGET_LANG="${TARGET_LANG:-go}"
+PROMPTS="$HARNESS/prompts/$TARGET_LANG"
+
 MAX_ROUNDS="${MAX_ROUNDS:-3}"       # review/fix rounds before an issue is abandoned
-# The critics, each backed by prompts/<role>.md. They run concurrently and every one must PASS.
-# Adding a role here and a prompt file is the whole of adding a reviewer.
+# The critics, each backed by prompts/$TARGET_LANG/<role>.md. They run concurrently and every one must
+# PASS. Adding a role here and a prompt file is the whole of adding a reviewer.
 CRITICS=(review idiom tests)
 MAX_ISSUES="${MAX_ISSUES:-0}"       # 0 = run until the queue is empty
 TIMEOUT="${TIMEOUT:-30m}"           # wall clock per invocation
@@ -159,7 +167,15 @@ spend_all_time() {
 command -v opencode >/dev/null || die "opencode not on PATH"
 command -v gh     >/dev/null || die "gh not on PATH"
 command -v jq     >/dev/null || die "jq not on PATH"
-command -v go     >/dev/null || say "WARNING: go not on PATH — the build and test gate will be skipped"
+# A TARGET_LANG names a gate script and a prompt set, or it names nothing at all. Failing here rather
+# than on the first issue keeps a typo'd value from spending a round before it is discovered.
+[ -f "$HARNESS/gate/$TARGET_LANG.sh" ] || die "TARGET_LANG=$TARGET_LANG has no gate script — expected $HARNESS/gate/$TARGET_LANG.sh. A language is added by writing its gate script and its prompts."
+[ -d "$PROMPTS" ] || die "TARGET_LANG=$TARGET_LANG has no prompt set — expected $PROMPTS"
+if [ "$TARGET_LANG" = go ]; then
+  command -v go >/dev/null || say "WARNING: go not on PATH — the build and test gate will be skipped"
+elif [ "$TARGET_LANG" = csharp ]; then
+  command -v dotnet >/dev/null || say "WARNING: dotnet not on PATH — the build and test gate will be skipped"
+fi
 
 # A cap that does not parse as a number is worse than no cap: awk would compare it as a string and
 # either never fire or fire before the first issue, and either way the operator believes they set one.
@@ -227,6 +243,18 @@ if [ -f "$REPO/go.mod" ] && command -v go >/dev/null 2>&1 && [ -z "${SKIP_MODULE
   probe_dir="${TMPDIR:-/tmp}"
   if ! (cd "$probe_dir" && ${probe[@]+"${probe[@]}"} go list -m -json golang.org/x/tools@latest) >/dev/null 2>&1; then
     say "WARNING: cannot resolve module versions — 'go list -m golang.org/x/tools@latest' failed or timed out. Any issue that adds a dependency will hang until TIMEOUT and come back unfinished. If proxy.golang.org is blocked here, GOPROXY=direct fetches straight from the VCS host (needs egress to go.googlesource.com). Issues that add no dependency are unaffected. Set SKIP_MODULE_CHECK=1 to silence this."
+  fi
+fi
+
+# The C# analogue of the probe above, and for the same reason: `dotnet restore` against a blocked
+# feed does not error, it waits, so the implementer spends its wall clock and comes back unfinished —
+# then does it again on the next issue. A HEAD to the NuGet v3 index is the probe: it needs no SDK,
+# no project, and cannot touch the repo. Same warning-not-fatal shape, same knob.
+if [ "$TARGET_LANG" = csharp ] && [ -z "${SKIP_MODULE_CHECK:-}" ]; then
+  probe=()
+  [ -n "$TIMEOUT_BIN" ] && probe=("$TIMEOUT_BIN" 15)
+  if ! ${probe[@]+"${probe[@]}"} curl -fsSI https://api.nuget.org/v3/index.json >/dev/null 2>&1; then
+    say "WARNING: cannot reach api.nuget.org — any issue that adds a package will hang until TIMEOUT and come back unfinished. Check egress to api.nuget.org, and to whatever feed the repo's NuGet.config names if it overrides the default. Issues that add no package are unaffected. Set SKIP_MODULE_CHECK=1 to silence this."
   fi
 fi
 
@@ -330,7 +358,7 @@ if [ -s "$LANDED" ]; then
   rm -f "$open_list"
 fi
 
-say "harness $HARNESS -> repo $REPO ($(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD))"
+say "harness $HARNESS -> repo $REPO ($(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)), target $TARGET_LANG"
 say "model $MODEL (implement/critics), $FLASH_MODEL (fix/retro), variant ${VARIANT:-default}, $MAX_ROUNDS rounds/issue, $TIMEOUT per invocation, $([ "$MAX_SPEND" = 0 ] && echo "no spend cap" || echo "\$$MAX_SPEND spend cap")"
 say "queue: $(gh issue list --state open --limit 300 --json number --jq 'length') open issue(s)"
 
@@ -362,17 +390,45 @@ oc_synth() {
 # oc_verdict <text> : emit {verdict, findings[]} if the text holds a parseable verdict, else fail.
 # opencode's run mode has no native JSON-schema enforcement, so the verdict is read out of the model's
 # text and validated here; a critic that did not answer in JSON fails closed, exactly like a crash.
+#
+# The model is allowed to present its JSON however it likes, and it exercises that latitude: the
+# first C# run (issue #1) produced three verdicts the old single-line extractor could not read. It
+# had two common shapes, both multi-line. Either the verdict was pretty-printed inside a ```json
+# fence, or it sat at the end of prose with no fence at all. The old code — jq on the whole text,
+# then `grep -oE '\{.*\}'` which matches braces only within one line — read both as "no verdict",
+# failed closed, and abandoned an issue whose final verdicts were PASS across all three critics.
+# Failing closed is the right answer to garbage, not to formatting: a critic that answered is a
+# verdict, whatever fence it wore. So the extraction walks down the possibilities: whole text, text
+# with fence markers stripped, then the last brace-balanced object anywhere in the text.
 oc_verdict() {
   local raw="$1" obj
-  if printf '%s' "$raw" | jq -e '.verdict | type == "string"' >/dev/null 2>&1; then
-    printf '%s' "$raw" | jq -c '{verdict: .verdict, findings: ((.findings // []) | if type == "array" then . else [] end)}'
+  # emit <json> : the canonical verdict, provided <json> parses and carries a verdict field.
+  emit() {
+    printf '%s' "$1" | jq -e '.verdict | type == "string"' >/dev/null 2>&1 || return 1
+    printf '%s' "$1" | jq -c '{verdict: .verdict, findings: ((.findings // []) | if type == "array" then . else [] end)}'
     return 0
-  fi
-  obj=$(printf '%s' "$raw" | grep -oE '\{.*\}' | tail -1)
-  if [ -n "$obj" ] && printf '%s' "$obj" | jq -e '.verdict | type == "string"' >/dev/null 2>&1; then
-    printf '%s' "$obj" | jq -c '{verdict: .verdict, findings: ((.findings // []) | if type == "array" then . else [] end)}'
-    return 0
-  fi
+  }
+  if emit "$raw"; then return 0; fi
+
+  # The ```json fence, stripped. The fence markers themselves make the text non-JSON, and nothing
+  # useful lives inside a fence other than what the model wants read as a value.
+  nofence=$(printf '%s' "$raw" | sed -E '/^[[:space:]]*```/d')
+  if emit "$nofence"; then return 0; fi
+
+  # The last brace-balanced JSON object, however many lines it spans. A single-line grep cannot see
+  # a pretty-printed verdict; awk tracking brace depth across lines can. Only a completed object that
+  # actually looks like a verdict (carries a "verdict" key) is remembered, so prose braces before or
+  # after it cannot shadow the real answer, and the captured text is multi-line-safe JSON that jq reads
+  # back as one object.
+  obj=$(printf '%s' "$nofence" | awk '
+      { for (i = 1; i <= length($0); i++) {
+          c = substr($0, i, 1)
+          if (c == "{")  { depth++; if (depth == 1) obj = "" }
+          if (depth > 0) { obj = obj c }
+          if (c == "}")  { depth--; if (depth == 0 && obj ~ /"verdict"/) last = obj }
+        } }
+      END { print last }')
+  if emit "$obj"; then return 0; fi
   return 1
 }
 
@@ -637,7 +693,7 @@ while :; do
     done
     [ -s "$carry" ] && say "  carrying $(grep -c '^- ' "$carry" | tr -d ' ') outstanding finding(s) from the abandoned attempt into the re-implementation"
   fi
-  { cat "$HARNESS/prompts/implement.md"
+  { cat "$PROMPTS/implement.md"
     echo "## Issue #$N: $TITLE"; echo
     cat "$LOGS/issue-$N.md"
     [ -s "$carry" ] && { echo; cat "$carry"; }
@@ -674,7 +730,7 @@ while :; do
         abandon_reason="the gate was still failing after $MAX_ROUNDS round(s) of fixes"
         break
       fi
-      { cat "$HARNESS/prompts/fix.md"
+      { cat "$PROMPTS/fix.md"
         echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo
         echo "## Failing checks"; echo '```'; cat "$LOGS/$TAG-gate-$round.txt"; echo '```'
       } | work "$TAG-fix-$round" "$FLASH_MODEL"
@@ -713,7 +769,7 @@ while :; do
         *" $role "*) [ "$round" -eq 1 ] && ctags="$TAG-$role-${round}a $TAG-$role-${round}b" ;;
       esac
       for ctag in $ctags; do
-        { cat "$HARNESS/prompts/$role.md"
+        { cat "$PROMPTS/$role.md"
           case "$ctag" in
             *b) cat <<'SWEEP'
 
@@ -780,7 +836,7 @@ SWEEP
       break
     fi
     say "  round $round:$verdicts — sending findings back"
-    { cat "$HARNESS/prompts/fix.md"
+    { cat "$PROMPTS/fix.md"
       echo "## Issue #$N: $TITLE"; echo; cat "$LOGS/issue-$N.md"; echo
       for role in "${CRITICS[@]}"; do
         [ "$(jq -r '.findings | length' "$LOGS/$TAG-$role-$round.verdict.json")" -gt 0 ] || continue
@@ -914,7 +970,7 @@ say "spend: \$$(spend_this_run) this run; \$$(spend_all_time) in $(basename "$LO
 # exit status a caller reads to decide whether the batch worked.
 if [ -n "${RETRO:-}" ] && [ "${#attempted_issues[@]}" -gt 0 ]; then
   REPO="$REPO" LOGS="$LOGS" MAX_ROUNDS="$MAX_ROUNDS" MODEL="$FLASH_MODEL" \
-    VARIANT="$VARIANT" TIMEOUT="$TIMEOUT" \
+    VARIANT="$VARIANT" TIMEOUT="$TIMEOUT" TARGET_LANG="$TARGET_LANG" \
     "$HARNESS/retro.sh" "${attempted_issues[@]}" \
     || say "retro: failed — the batch above is unaffected"
 fi
