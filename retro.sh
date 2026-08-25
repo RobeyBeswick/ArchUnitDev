@@ -27,6 +27,7 @@ MAX_ROUNDS="${MAX_ROUNDS:-3}"
 CRITICS=(review idiom tests)
 TIMEOUT="${TIMEOUT:-30m}"
 MODEL="${MODEL:-opencode-go/deepseek-v4-flash}"
+VARIANT="${VARIANT:-high}"
 STAMP="$(date -u '+%Y%m%dT%H%M%SZ')"
 OUT="${OUT:-$LOGS/retro-$STAMP.md}"
 
@@ -154,12 +155,15 @@ say "retro: reviewing issue(s) ${ISSUES[*]} — pack is $(wc -c < "$pack" | tr -
 # stripped from every other model invocation: nothing here has any business closing an issue or pushing.
 timeout_cmd=()
 command -v timeout >/dev/null && timeout_cmd=(timeout "$TIMEOUT")
+variant=()
+[ -n "${VARIANT:-}" ] && variant=(--variant "$VARIANT")
 
 { cat "$HARNESS/prompts/retro.md"; printf '\n---\n\n'; cat "$pack"; } \
   | env -u GH_TOKEN -u GITHUB_TOKEN \
     ${timeout_cmd[@]+"${timeout_cmd[@]}"} opencode run \
       --format json \
       --model "$MODEL" \
+      ${variant[@]+"${variant[@]}"} \
       --agent readonly \
       --dir "$REPO" \
       --title "retro-$STAMP" \
