@@ -36,11 +36,14 @@ MAX_ROUNDS="${MAX_ROUNDS:-3}"       # review/fix rounds before an issue is aband
 CRITICS=(review idiom tests)
 MAX_ISSUES="${MAX_ISSUES:-0}"       # 0 = run until the queue is empty
 TIMEOUT="${TIMEOUT:-30m}"           # wall clock per invocation
-# opencode provider/model IDs. The reasoning roles — implementer and the three critics — take MODEL;
-# the fixer and the retrospective take FLASH_MODEL, where cheap is good enough. Both must name a
-# provider/model that `opencode models` lists and that the machine is authenticated for.
-MODEL="${MODEL:-opencode-go/deepseek-v4-pro}"
+# opencode provider/model IDs. MODEL feeds the implementer and the three critics, FLASH_MODEL the fixer
+# and the retrospective. Both default to deepseek-v4-flash for now — the experiment is running the whole
+# loop on one model; point MODEL back at deepseek-v4-pro to split reasoning from cheap roles again. Both
+# must name a provider/model that `opencode models` lists and that the machine is authenticated for.
+MODEL="${MODEL:-opencode-go/deepseek-v4-flash}"
 FLASH_MODEL="${FLASH_MODEL:-opencode-go/deepseek-v4-flash}"
+# opencode reasoning-effort variant, applied to every invocation. Empty = the model's own default.
+VARIANT="${VARIANT:-high}"
 MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-400000}"
 NO_PUSH="${NO_PUSH:-}"              # set to 1 to commit locally but not push or close issues
 MAX_CONSECUTIVE_ABANDONS="${MAX_CONSECUTIVE_ABANDONS:-2}"   # stop the run after this many in a row; 0 = never stop
@@ -328,7 +331,7 @@ if [ -s "$LANDED" ]; then
 fi
 
 say "harness $HARNESS -> repo $REPO ($(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD))"
-say "model $MODEL (implement/critics), $FLASH_MODEL (fix/retro), $MAX_ROUNDS rounds/issue, $TIMEOUT per invocation, $([ "$MAX_SPEND" = 0 ] && echo "no spend cap" || echo "\$$MAX_SPEND spend cap")"
+say "model $MODEL (implement/critics), $FLASH_MODEL (fix/retro), variant ${VARIANT:-default}, $MAX_ROUNDS rounds/issue, $TIMEOUT per invocation, $([ "$MAX_SPEND" = 0 ] && echo "no spend cap" || echo "\$$MAX_SPEND spend cap")"
 say "queue: $(gh issue list --state open --limit 300 --json number --jq 'length') open issue(s)"
 
 # PREFLIGHT_ONLY=1 verifies the wiring — auth, tools, repo, remote, queue — and spends nothing.
@@ -381,12 +384,15 @@ oc_verdict() {
 # Only the harness holds the token.
 work() {
   local tag="$1" model="${2:-$MODEL}"
+  local variant=()
+  [ -n "${VARIANT:-}" ] && variant=(--variant "$VARIANT")
   # The +expansion guard is not decoration: bash 3.2, which is what macOS ships, treats
   # "${arr[@]}" on an empty array as an unbound variable under `set -u`.
   env -u GH_TOKEN -u GITHUB_TOKEN \
   ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} opencode run \
     --format json \
     --model "$model" \
+    ${variant[@]+"${variant[@]}"} \
     --auto \
     --dir "$REPO" \
     --title "$tag" \
@@ -402,12 +408,15 @@ work() {
 # Fails closed — a crashed or truncated critic is a FAIL, never a silent PASS.
 critic() {
   local tag="$1" out="$2"
+  local variant=()
+  [ -n "${VARIANT:-}" ] && variant=(--variant "$VARIANT")
   # The +expansion guard is not decoration: bash 3.2, which is what macOS ships, treats
   # "${arr[@]}" on an empty array as an unbound variable under `set -u`.
   env -u GH_TOKEN -u GITHUB_TOKEN \
   ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} opencode run \
     --format json \
     --model "$MODEL" \
+    ${variant[@]+"${variant[@]}"} \
     --agent readonly \
     --dir "$REPO" \
     --title "$tag" \
@@ -905,7 +914,7 @@ say "spend: \$$(spend_this_run) this run; \$$(spend_all_time) in $(basename "$LO
 # exit status a caller reads to decide whether the batch worked.
 if [ -n "${RETRO:-}" ] && [ "${#attempted_issues[@]}" -gt 0 ]; then
   REPO="$REPO" LOGS="$LOGS" MAX_ROUNDS="$MAX_ROUNDS" MODEL="$FLASH_MODEL" \
-    TIMEOUT="$TIMEOUT" \
+    VARIANT="$VARIANT" TIMEOUT="$TIMEOUT" \
     "$HARNESS/retro.sh" "${attempted_issues[@]}" \
     || say "retro: failed — the batch above is unaffected"
 fi
