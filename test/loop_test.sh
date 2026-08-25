@@ -129,6 +129,45 @@ scenario_happy() {
   [ -f "$REPO/cover.out" ] && bad "cover.out was left in the repo" || ok "no coverage profile left in the repo"
 }
 
+# The seam itself: a second language stack driven by the same loop. The fixture is deliberately bare —
+# no .sln/.csproj — so the csharp gate runs only its reward-hacking guards, exactly the shape the Go
+# fixture uses with no go.mod, and the loop is proven language-agnostic end to end without needing
+# dotnet on PATH. What this pins down: TARGET_LANG dispatches to the right gate script and the right
+# prompt set, and nothing else in the loop cares which language it is driving.
+scenario_csharp() {
+  setup
+  run_loop happy MAX_ISSUES=1 TARGET_LANG=csharp
+
+  want "$RC" "exits 0"
+  want_grep "target csharp" "$ROOT/run.out" "the run dispatched to the csharp stack"
+  want_grep "round 1: gate clean" "$ROOT/run.out" "the csharp gate ran and passed"
+  want_grep "no .sln/.slnx/.csproj yet" "$ROOT/logs/2-gate-1.txt" \
+            "guard-only mode on a repo with no project, like the Go fixture without a go.mod"
+  want_grep "round 1: all 3 critics PASS" "$ROOT/run.out" "all three critics passed"
+  want_grep "#2 DONE" "$ROOT/run.out" "issue landed"
+  want_grep "dotnet build" "$STUB_DIR/2-implement.stdin" "the implementer got the csharp prompt set"
+  want_no_grep "go build" "$STUB_DIR/2-implement.stdin" "and not the go one"
+
+  run_loop happy MAX_ISSUES=1 TARGET_LANG=cobol
+  [ "$RC" -ne 0 ]; want $? "an unknown TARGET_LANG is fatal in preflight"
+  want_grep "TARGET_LANG=cobol has no gate script" "$ROOT/run.out" "and names the missing gate script"
+}
+
+# A critic that answers in a ```json fence, pretty-printed across lines — the measured shape on the
+# first C# run, where the model returned PASS verdicts the single-line extractor read as "no verdict",
+# failed closed, and abandoned an issue whose critics had all approved. This pins the extraction to
+# the formatting the model actually uses, so a regression turns a landed issue into an abandoned one
+# in the suite instead of on the target repo.
+scenario_fencedjson() {
+  setup
+  run_loop fencedjson MAX_ISSUES=1
+
+  want "$RC" "exits 0"
+  want_grep "round 1: all 3 critics PASS" "$ROOT/run.out" "the fenced multi-line verdict was parsed, not failed closed"
+  want_no_grep "no verdict in the output" "$ROOT/run.out" "no critic failed closed"
+  want_grep "#2 DONE" "$ROOT/run.out" "issue landed"
+}
+
 # A critic returns FAIL. The findings must reach the fixer, and round 2 must re-review and land.
 # This is the path the whole review half of the harness exists for.
 scenario_fixround() {
@@ -861,7 +900,7 @@ SH
   # Code lines only — the comments explaining the ban name the banned shape, and a guard that trips on
   # its own rationale teaches the next person to delete the rationale.
   local offenders
-  offenders=$(grep -n '| *grep -q' "$HARNESS/gate.sh" "$HARNESS/run.sh" "$HARNESS/retro.sh" 2>/dev/null \
+  offenders=$(grep -n '| *grep -q' "$HARNESS/gate.sh" "$HARNESS"/gate/*.sh "$HARNESS/run.sh" "$HARNESS/retro.sh" 2>/dev/null \
               | grep -vE ':[[:space:]]*#')
   if [ -z "$offenders" ]; then
     ok "no 'cmd | grep -q' pipeline in the harness — pipefail reports the writer's SIGPIPE, not the match"
@@ -1110,7 +1149,7 @@ scenario_carry_default_off() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning test_files_guard push_credential workflow_scope abandon_count pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro"
+ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning test_files_guard push_credential workflow_scope abandon_count pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro csharp fencedjson"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then

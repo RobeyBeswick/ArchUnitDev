@@ -25,6 +25,8 @@ REPO="${REPO:-/work/repo}"
 
 MAX_ROUNDS="${MAX_ROUNDS:-3}"
 CRITICS=(review idiom tests)
+TARGET_LANG="${TARGET_LANG:-go}"
+PROMPTS="$HARNESS/prompts/$TARGET_LANG"
 TIMEOUT="${TIMEOUT:-30m}"
 MODEL="${MODEL:-opencode-go/deepseek-v4-flash}"
 VARIANT="${VARIANT:-high}"
@@ -158,7 +160,7 @@ command -v timeout >/dev/null && timeout_cmd=(timeout "$TIMEOUT")
 variant=()
 [ -n "${VARIANT:-}" ] && variant=(--variant "$VARIANT")
 
-{ cat "$HARNESS/prompts/retro.md"; printf '\n---\n\n'; cat "$pack"; } \
+{ cat "$PROMPTS/retro.md"; printf '\n---\n\n'; cat "$pack"; } \
   | env -u GH_TOKEN -u GITHUB_TOKEN \
     ${timeout_cmd[@]+"${timeout_cmd[@]}"} opencode run \
       --format json \

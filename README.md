@@ -146,9 +146,13 @@ running the script again.
 
 ### The gate
 
-`gate.sh` runs the deterministic checks before any reviewer sees the diff: `go build`, `go vet ./...`,
+`gate.sh` dispatches to the deterministic checks for the target repo's stack, `gate/$TARGET_LANG.sh`,
+which runs before any reviewer sees the diff. For Go that is `go build`, `go vet ./...`,
 `golangci-lint`, `go test -race -shuffle=on -covermode=atomic`, `go mod tidy -diff`, and a cross-compile
-for `windows/amd64` and `linux/386`. A gate failure goes to the fixer and does not consume a review round.
+for `windows/amd64` and `linux/386`. For C# it is `dotnet restore`, `dotnet build --no-restore`,
+`dotnet format --verify-no-changes`, `dotnet test --no-build`, a `win-x64` cross-RID publish and the
+vulnerability scan. A gate failure goes to the fixer and does not consume a review round. A language is
+added by writing its gate script and its prompts; the loop does not know which one it is driving.
 
 ### Roles
 
@@ -228,7 +232,7 @@ RETRO=1 MAX_ISSUES=3 ./run.sh     # at the end of the batch
 PACK_ONLY=1 ./retro.sh            # the evidence, without spending anything on the model
 ```
 
-- It reviews the machinery, not the code — its subject is `prompts/*.md`, `gate.sh` and the round
+- It reviews the machinery, not the code — its subject is `prompts/$TARGET_LANG/*.md`, `gate.sh` and the round
   structure.
 - It is cross-issue, which is where the signal is. One issue cannot tell you that the same convention
   blocked three.
@@ -250,6 +254,7 @@ All environment variables, all with defaults that work:
 |---|---|---|
 | `REPO` | `/work/repo` | Target repository. |
 | `LOGS` | `$HARNESS/logs` | Log directory. |
+| `TARGET_LANG` | `go` | The language stack of the target repo. Selects the deterministic gate (`gate/$TARGET_LANG.sh`) and the prompt set (`prompts/$TARGET_LANG/`). A language is added by writing its gate script and its prompts; the loop itself is language-agnostic. Deliberately not named `LANG`, which is the POSIX locale variable. |
 | `MAX_ROUNDS` | `3` | *Fix* rounds before an issue is [abandoned](#abandonment-and-retry). The loop runs one more judged round than this, so its last act on an issue is always a gate plus a verdict, never a fix nobody looked at. `MAX_ROUNDS=3` means at most 3 fixes and up to 4 rounds of critics. |
 | `MAX_ISSUES` | `0` | Issues to *attempt*, abandonments included — a bound on what the run touches and what it spends, not on how much of it lands. `0` = run until the queue is empty. Set to `1` for a [smoke test](#quick-start). |
 | `MAX_CONSECUTIVE_ABANDONS` | `2` | Stop the run after this many issues are abandoned back to back, on the reasoning that a run of abandons is far more often a broken environment than several independently hard issues. `0` = never stop. |
