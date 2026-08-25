@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 #
-# Stand-in for `claude -p`, used by test/loop_test.sh. Contacts no model and costs nothing.
+# Stand-in for `opencode run`, used by test/loop_test.sh. Contacts no model and costs nothing.
 #
-# It works out which invocation it is from the --debug-file path, because that is the only place
+# It works out which invocation it is from the --title argument, because that is the only place
 # run.sh puts the tag ("2-implement", "2-review-1", "2-fix-2", ...) into the command line. It
 # captures its stdin so the test can assert on what the harness actually put in each prompt, and
 # it edits the working tree for implement/fix invocations so the diff the critics see is non-empty.
 #
+# It emits the ndjson event stream `opencode run --format json` produces — step_start, text,
+# step_finish — so that run.sh's real envelope synthesis is what is exercised here.
+#
 set -uo pipefail
+
+# Non-run invocations the harness makes during preflight. They are not an agent call, so they have
+# no tag and no stdin to capture; succeed so the preflight does not die.
+case "${1:-}" in
+  auth|models) exit 0 ;;
+esac
 
 : "${STUB_DIR:?stub needs STUB_DIR}"
 : "${SCENARIO:?stub needs SCENARIO}"
@@ -15,10 +24,10 @@ set -uo pipefail
 tag=""
 prev=""
 for a in "$@"; do
-  [ "$prev" = "--debug-file" ] && tag="$(basename "$a" .debug.log)"
+  [ "$prev" = "--title" ] && tag="$a"
   prev="$a"
 done
-[ -n "$tag" ] || { echo "stub claude: no --debug-file in args" >&2; exit 64; }
+[ -n "$tag" ] || { echo "stub opencode: no --title in args" >&2; exit 64; }
 
 mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/$tag.stdin"
@@ -33,27 +42,27 @@ printf '%s %s\n' "$tag" "${GH_TOKEN:-(unset)}" >> "$STUB_DIR/tokens"
 round="${tag##*-}"   # meaningless for "*-implement", unused there
 issue="${tag%%-*}"
 
-result() {
-  jq -n --arg r "$1" '{
-    type: "result", subtype: "success", is_error: false, result: $r,
-    total_cost_usd: 0.01, num_turns: 3, terminal_reason: "end_turn"
-  }'
+# The ndjson stream run.sh reads: last text part = result, sum of step_finish cost = total_cost_usd,
+# count of step_finish = num_turns, last reason = terminal_reason.
+emit() {
+  jq -cn '{type:"step_start",part:{type:"step-start"}}'
+  jq -cn --arg t "$1" '{type:"text",part:{type:"text",text:$t}}'
+  jq -cn --argjson c "$2" '{type:"step_finish",part:{type:"step-finish",reason:"stop",tokens:{total:3,input:2,output:1},cost:$c}}'
 }
 
-# A critic answer, in the envelope run.sh reads: .structured_output, validated by --json-schema.
+result() {
+  emit "$1" 0.01
+}
+
+# A critic answer. It is plain text (the verdict JSON), because opencode's run mode has no native
+# JSON-schema flag; run.sh's oc_verdict validates it and fails closed on anything unparseable.
 verdict_pass() {
-  jq -n '{
-    type: "result", subtype: "success", is_error: false, result: "PASS",
-    total_cost_usd: 0.02, num_turns: 5,
-    structured_output: { verdict: "PASS", findings: [] }
-  }'
+  emit '{"verdict":"PASS","findings":[]}' 0.02
 }
 verdict_fail() {
-  jq -n --arg f "$1" --arg p "$2" --arg x "$3" '{
-    type: "result", subtype: "success", is_error: false, result: "FAIL",
-    total_cost_usd: 0.02, num_turns: 5,
-    structured_output: { verdict: "FAIL", findings: [ { file: $f, problem: $p, fix: $x } ] }
-  }'
+  local v
+  v=$(jq -cn --arg f "$1" --arg p "$2" --arg x "$3" '{verdict:"FAIL",findings:[{file:$f,problem:$p,fix:$x}]}')
+  emit "$v" 0.02
 }
 
 case "$tag" in
@@ -125,7 +134,7 @@ case "$tag" in
                  "Nothing this round can do about it."
           else verdict_pass
         fi ;;
-      *) echo "stub claude: unknown SCENARIO $SCENARIO" >&2; exit 64 ;;
+      *) echo "stub opencode: unknown SCENARIO $SCENARIO" >&2; exit 64 ;;
     esac
     ;;
 
@@ -160,7 +169,7 @@ case "$tag" in
 
   retro-*)
     # The retrospective. Its output is markdown for a human, not a schema, so the only thing the
-    # stub has to be faithful about is where it comes back: `.result`.
+    # stub has to be faithful about is where it comes back: the last text part.
     result "## Verdict
 The loop landed the batch in one round each. No change needed.
 
@@ -169,5 +178,5 @@ None worth making from a batch this size."
     ;;
 
   *)
-    echo "stub claude: unrecognised tag $tag" >&2; exit 64 ;;
+    echo "stub opencode: unrecognised tag $tag" >&2; exit 64 ;;
 esac
