@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # `timeout` is coreutils; it exists in the Docker image but not on a stock macOS box, and run.sh
-# wraps every model invocation in it. This shim drops the duration and runs the command, so the
-# harness test can run on a developer machine. It deliberately does not emulate the timeout itself.
+# wraps every model invocation in it. This shim drops the timeout arguments and runs the command, so
+# the harness test can run on a developer machine. It deliberately does not emulate the timeout
+# itself.
+#
+# run.sh invokes it as `timeout -k 60 <duration> <command ...>` since the -k fix (issue #6's wedge:
+# TERM alone never killed the hung opencode). The shim must strip both the -k grace period and the
+# duration before exec'ing the command.
 set -uo pipefail
+if [ "${1:-}" = "-k" ]; then
+  shift 2
+fi
 shift
 exec "$@"

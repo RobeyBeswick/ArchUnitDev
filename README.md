@@ -263,7 +263,7 @@ All environment variables, all with defaults that work:
 | `MAX_SPEND` | `0` | Dollars *this run* may spend before it stops. Checked at issue boundaries only; measured from each invocation's `total_cost_usd`, counting only this run's artifacts. `0` = no cap. See [spend cap](#spend-cap). |
 | `PREFLIGHT_ONLY` | unset | Verify auth, tools, repo, remote and queue, then exit. Spends nothing. See [preflight](#preflight). |
 | `NO_PUSH` | unset | Commit locally, but do not push and do not close the issue. Use it for the first run. The issue is recorded in `logs/landed` so the queue still advances. |
-| `TIMEOUT` | `30m` | Wall clock per invocation. |
+| `TIMEOUT` | `60m` | Wall clock per invocation. The default is 60m rather than 30m because the implementer of the extraction issues measured itself spending its whole 30m budget on reconnaissance before writing any files — the second attempt at #7 ran out at 30m having written nothing, and the 60m attempt landed the same issue. 30m still works for small issues; it is the budget the bigger ones starve on. |
 | `MODEL` | `opencode-go/deepseek-v4-pro` | opencode `provider/model` ID for the reasoning roles — the implementer and the three critics. |
 | `FLASH_MODEL` | `opencode-go/deepseek-v4-flash` | opencode `provider/model` ID for the cheap roles — the fixer and the retrospective. |
 | `MAX_DIFF_BYTES` | `400000` | Diff truncation point for the critics. |
