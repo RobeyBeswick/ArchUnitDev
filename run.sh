@@ -43,7 +43,7 @@ MAX_ROUNDS="${MAX_ROUNDS:-3}"       # review/fix rounds before an issue is aband
 # PASS. Adding a role here and a prompt file is the whole of adding a reviewer.
 CRITICS=(review idiom tests)
 MAX_ISSUES="${MAX_ISSUES:-0}"       # 0 = run until the queue is empty
-TIMEOUT="${TIMEOUT:-30m}"           # wall clock per invocation
+TIMEOUT="${TIMEOUT:-60m}"           # wall clock per invocation
 # opencode provider/model IDs. MODEL feeds the implementer and the three critics, FLASH_MODEL the fixer
 # and the retrospective. Both default to deepseek-v4-flash for now — the experiment is running the whole
 # loop on one model; point MODEL back at deepseek-v4-pro to split reasoning from cheap roles again. Both
@@ -186,8 +186,14 @@ esac
 # `timeout` is coreutils: it is in the image, but not on a stock macOS box, where it is `gtimeout`
 # or absent entirely. Resolve it once here — otherwise every invocation dies on "command not found"
 # and the run burns the whole queue doing nothing.
-if   command -v timeout  >/dev/null 2>&1; then TIMEOUT_CMD=(timeout "$TIMEOUT");  TIMEOUT_BIN=timeout
-elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD=(gtimeout "$TIMEOUT"); TIMEOUT_BIN=gtimeout
+#
+# `-k 60`: a plain `timeout "$TIMEOUT"` sends TERM at the limit and then *waits forever* if the child
+# ignores it. Measured on issue #6: three critics hung with no output for 40 minutes past the 30m
+# limit, because TERM alone did not kill the wedged opencode, and the run sat there until a human
+# killed it by hand. `-k 60` turns that into "TERM at the limit, SIGKILL 60 seconds later" — a wedged
+# invocation burns 31 minutes of wall clock instead of the rest of the night.
+if   command -v timeout  >/dev/null 2>&1; then TIMEOUT_CMD=(timeout -k 60 "$TIMEOUT");  TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD=(gtimeout -k 60 "$TIMEOUT"); TIMEOUT_BIN=gtimeout
 else
   TIMEOUT_CMD=(); TIMEOUT_BIN=
   say "WARNING: neither timeout nor gtimeout is on PATH — invocations will run with no wall-clock limit and TIMEOUT=$TIMEOUT is ignored. A wedged invocation will hang the run. Install coreutils."
@@ -402,10 +408,16 @@ oc_synth() {
 # with fence markers stripped, then the last brace-balanced object anywhere in the text.
 oc_verdict() {
   local raw="$1" obj
-  # emit <json> : the canonical verdict, provided <json> parses and carries a verdict field.
+  # emit <json> : the canonical verdict, provided <json> is exactly one JSON object carrying a verdict
+  # field. `jq -s` slurps the whole input into one array, so a multi-document stream — the model has
+  # been measured echoing the schema JSON and then answering with its verdict — has length 2, fails
+  # this check, and falls through to the brace extractor below. A plain `jq -e` would pass it (the
+  # last document wins) and then print every document, writing a two-object verdict file: the run
+  # read `.verdict` off that and saw "null" first, which a PASS would have turned into a silent
+  # abandonment. Requiring one document makes the format check the real contract.
   emit() {
-    printf '%s' "$1" | jq -e '.verdict | type == "string"' >/dev/null 2>&1 || return 1
-    printf '%s' "$1" | jq -c '{verdict: .verdict, findings: ((.findings // []) | if type == "array" then . else [] end)}'
+    printf '%s' "$1" | jq -se 'length == 1 and (.[0] | type == "object") and (.[0].verdict | type == "string")' >/dev/null 2>&1 || return 1
+    printf '%s' "$1" | jq -s '.[0] | {verdict: .verdict, findings: ((.findings // []) | if type == "array" then . else [] end)}'
     return 0
   }
   if emit "$raw"; then return 0; fi

@@ -168,6 +168,21 @@ scenario_fencedjson() {
   want_grep "#2 DONE" "$ROOT/run.out" "issue landed"
 }
 
+# The model echoing the verdict schema back before answering — two JSON documents in one output. The
+# first-pass extractor validated the last document and then printed every one of them, so the verdict
+# file held a "null" object followed by the real one, and a PASS was read as FAIL. The extractor must
+# take the single real document. Measured on issue #7 round 4; pinned here so it stays fixed.
+scenario_schemaecho() {
+  setup
+  run_loop schemaecho MAX_ISSUES=1
+
+  want "$RC" "exits 0"
+  want_grep "round 1: all 3 critics PASS" "$ROOT/run.out" "the schema-echoed verdict was parsed as one document"
+  want_no_grep "no verdict in the output" "$ROOT/run.out" "no critic failed closed"
+  want_no_grep "WARNING: all critics approved but the tree matches base" "$ROOT/run.out" "and the verdict was not misread as a null FAIL"
+  want_grep "#2 DONE" "$ROOT/run.out" "issue landed"
+}
+
 # A critic returns FAIL. The findings must reach the fixer, and round 2 must re-review and land.
 # This is the path the whole review half of the harness exists for.
 scenario_fixround() {
@@ -1149,7 +1164,7 @@ scenario_carry_default_off() {
 
 # --- driver -----------------------------------------------------------------------
 
-ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning test_files_guard push_credential workflow_scope abandon_count pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro csharp fencedjson"
+ALL="happy fixround testcritic garbage abandon late_pass nodiff no_push two_issues bounded retry carry_across_runs carry_default_off spend double_critic kind_pinning test_files_guard push_credential workflow_scope abandon_count pushfail breaker preflight moduleproxy relative_logs dirty retro_pack retro csharp fencedjson schemaecho"
 for s in ${*:-$ALL}; do
   printf '\n=== %s\n' "$s"
   if ! declare -F "scenario_$s" >/dev/null; then

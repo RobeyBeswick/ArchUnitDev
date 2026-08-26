@@ -78,6 +78,15 @@ verdict_pass_fenced() {
 ```' 0.02
 }
 
+# The model has also been measured echoing the verdict schema back before answering — which makes the
+# output two JSON documents, and the extractor's first attempt (validate the last document, then print
+# every one of them) wrote a two-object verdict file. Read `.verdict` off that and a PASS becomes a
+# silent abandonment. This is that shape: schema echo first, real verdict second.
+verdict_pass_schema_echo() {
+  emit '{"type":"object","properties":{"verdict":{"enum":["PASS","FAIL"]},"findings":{"type":"array","items":{"type":"object","properties":{"file":{"type":"string"},"problem":{"type":"string"},"fix":{"type":"string"}}}}}}' 0.02
+  emit '{"verdict":"PASS","findings":[]}' 0.02
+}
+
 case "$tag" in
   *-implement)
     # An implementer that returns having changed nothing — what a real one does when it reads the
@@ -103,7 +112,7 @@ case "$tag" in
 
   *-review-*)
     case "$SCENARIO" in
-      happy|testcritic|union|fencedjson) verdict_pass ;;
+      happy|testcritic|union|fencedjson|schemaecho) verdict_pass ;;
       fixround)
         if grep -q FIXROUND-ACK NOTES.md 2>/dev/null
           then verdict_pass
@@ -161,6 +170,10 @@ case "$tag" in
       # verdict is PASS, so if the extractor regresses the run abandons instead of landing — which
       # is the assertion the scenario makes.
       fencedjson) verdict_pass_fenced ;;
+      # The critic echoes the schema JSON and then answers — two documents. The old first-attempt
+      # extractor wrote both to the verdict file; read off that, a PASS verdict reads as "null"
+      # first and the issue abandons. The extractor must take the single real document.
+      schemaecho) verdict_pass_schema_echo ;;
       # Two concurrent passes of the same critic, each seeing something the other does not — the
       # measured failure DOUBLE_CRITICS exists for. Which pass this is comes from the tag, which is
       # also the only thing that differs between the two invocations.
