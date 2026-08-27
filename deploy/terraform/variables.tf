@@ -12,16 +12,13 @@ variable "name" {
 
 variable "instance_type" {
   description = <<-EOT
-    The loop is almost entirely waiting on the Bedrock API, so CPU count is not what decides this.
-    Memory is: the gate runs `go test -race`, which costs 5-10x the memory of a plain test binary, on
-    top of golangci-lint type-checking the whole package graph. The failure mode is the OOM killer
-    taking out a gate step, which reads in the log as a code defect and sends the fixer after
-    something that is not there — an hour of spend on a bug that does not exist.
-
-    m5.large (2 vCPU / 8GiB), one size down from the m5.xlarge this used to be. t3.medium's 4GB is the
-    *floor* for the gate rather than comfortable headroom — 8GiB is twice that — and a burstable
-    instance puts the CPU credit balance in the path of the one sustained-CPU part of the run. See
-    var.retry_instance_type for the longer version of both arguments.
+    The loop is almost entirely waiting on the model API, so CPU count is not what decides this.
+    Memory is: the gate runs `dotnet build` + `dotnet test`, and the C# toolchain is lighter than the
+    Go gate this was originally sized for (`go test -race` + golangci-lint type-checking the package
+    graph). t3.large keeps the 8GiB memory floor that matters while running cheaper than m5.large, and
+    the burstable-CPU concern is muted here because the loop burns CPU only during brief gate runs and
+    waits minutes between them on the model API — the credits recover. t3.medium's 4GB is the *floor*
+    rather than comfortable headroom, which is why this is not t3.medium.
 
     Changing this on an existing host is an in-place update that STOPS AND STARTS the instance.
     Under NO_PUSH the volume holds commits that exist nowhere else, and stopping mid-run kills the
@@ -29,7 +26,7 @@ variable "instance_type" {
     during one, and read the plan before saying yes.
   EOT
   type        = string
-  default     = "m5.large"
+  default     = "t3.large"
 }
 
 variable "retry_host" {
