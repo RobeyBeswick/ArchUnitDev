@@ -18,10 +18,10 @@ variable "instance_type" {
     taking out a gate step, which reads in the log as a code defect and sends the fixer after
     something that is not there — an hour of spend on a bug that does not exist.
 
-    m5.xlarge (4 vCPU / 16GiB) rather than the t3.medium this started on. t3.medium's 4GB is the
-    *floor* for the gate rather than comfortable headroom, and a burstable instance puts the CPU
-    credit balance in the path of the one sustained-CPU part of the run. See var.retry_instance_type
-    for the longer version of both arguments.
+    m5.large (2 vCPU / 8GiB), one size down from the m5.xlarge this used to be. t3.medium's 4GB is the
+    *floor* for the gate rather than comfortable headroom — 8GiB is twice that — and a burstable
+    instance puts the CPU credit balance in the path of the one sustained-CPU part of the run. See
+    var.retry_instance_type for the longer version of both arguments.
 
     Changing this on an existing host is an in-place update that STOPS AND STARTS the instance.
     Under NO_PUSH the volume holds commits that exist nowhere else, and stopping mid-run kills the
@@ -29,7 +29,7 @@ variable "instance_type" {
     during one, and read the plan before saying yes.
   EOT
   type        = string
-  default     = "m5.xlarge"
+  default     = "m5.large"
 }
 
 variable "retry_host" {
@@ -52,7 +52,7 @@ variable "retry_instance_type" {
     `go test -race` and golangci-lint gate as the loop host, but against a diff that has already
     proved big enough to time an implementer out, and for up to 11 rounds instead of 5 — and an
     OOM-killed gate step is the one failure that reads in the log as a code defect and sends a fixer
-    after something that is not there. m5.xlarge is 4 vCPU / 16GiB.
+    after something that is not there. m5.large is 2 vCPU / 8GiB.
 
     m5 rather than t3.xlarge at the same size: t3 is burstable, and the gate is precisely the
     sustained-CPU part of the run. Depleted CPU credits would show up as a gate step that takes
@@ -61,7 +61,7 @@ variable "retry_instance_type" {
     removes the whole failure mode.
   EOT
   type        = string
-  default     = "m5.xlarge"
+  default     = "m5.large"
 }
 
 variable "volume_size" {
@@ -73,7 +73,7 @@ variable "volume_size" {
 variable "target_repo" {
   description = "The repository the loop works through, cloned onto the instance at boot."
   type        = string
-  default     = "https://github.com/LukasNiessen/ArchUnitGo.git"
+  default     = "https://github.com/RobeyBeswick/ArchUnitSharp.git"
 }
 
 variable "harness_repo" {
@@ -102,29 +102,30 @@ variable "gh_token_secret_name" {
   default     = "archunitdev/gh-token"
 }
 
+variable "opencode_secret_name" {
+  description = <<-EOT
+    Secrets Manager secret holding the opencode provider key, as a plain string. opencode carries its
+    own provider auth (stored in ~/.local/share/opencode/auth.json on a workstation), and there is no
+    instance-profile mechanism for it the way there was for Bedrock — so the key lives here, in its own
+    secret (never the same one as the GH token), and the bootstrap writes it into the opencode auth
+    file. Created outside Terraform on purpose, like the GH token:
+
+      aws secretsmanager create-secret --name archunitdev/opencode-key --secret-string 'sk-...'
+
+    The value is the provider key for the `opencode-go` provider the harness's MODEL/FLASH_MODEL name.
+  EOT
+  type        = string
+  default     = "archunitdev/opencode-key"
+}
+
 variable "image_tag" {
   description = "Tag of the harness image in the private ECR repository this stack creates."
   type        = string
   default     = "latest"
 }
 
-variable "bedrock_vpc_endpoint" {
-  description = <<-EOT
-    Send Bedrock inference through a PrivateLink endpoint instead of out through the NAT gateway, so
-    the diffs and prompts never traverse the public internet. Costs ~$7/month.
-
-    Set to false if inference stops resolving: the pinned model is the *global* inference profile
-    `global.anthropic.claude-opus-5`, which the SDK reaches through the regional endpoint but which
-    routes across regions server-side. That should be unaffected by a regional PrivateLink endpoint,
-    but it is the one assumption in this stack worth proving with a PREFLIGHT_ONLY=1 run rather than
-    trusting.
-  EOT
-  type        = bool
-  default     = true
-}
-
 variable "secretsmanager_vpc_endpoint" {
-  description = "Fetch the GitHub token over PrivateLink rather than through the NAT gateway. ~$7/month."
+  description = "Fetch the GitHub token and the opencode key over PrivateLink rather than through the NAT gateway. ~$7/month."
   type        = bool
   default     = true
 }

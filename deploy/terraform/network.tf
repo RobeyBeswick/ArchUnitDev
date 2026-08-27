@@ -1,5 +1,5 @@
 # The network posture, and the one sentence that explains all of it: the loop needs to reach out
-# (Bedrock, GitHub) and nothing ever needs to reach in.
+# (opencode's provider, GitHub, NuGet) and nothing ever needs to reach in.
 #
 # So the instance sits in a private subnet with no public address, and there is no route by which a
 # packet from the internet could arrive: not an open port, not a closed one. Egress goes through a NAT
@@ -111,7 +111,7 @@ resource "aws_security_group" "instance" {
   ingress = []
 
   egress {
-    description = "Bedrock, GitHub, the Go module proxy, and the AWS APIs. All HTTPS."
+    description = "The opencode provider, GitHub, NuGet, and the AWS APIs. All HTTPS."
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
@@ -145,11 +145,12 @@ resource "aws_security_group" "endpoints" {
 # --- endpoints ---------------------------------------------------------------------------------
 #
 # The S3 gateway endpoint is free and does two jobs: the log sync writes through it, and ECR stores
-# image layers in S3, so pulling the harness image uses it too. The two interface endpoints are the
-# ones carrying content worth keeping off the public internet — the prompts and diffs (Bedrock) and
-# the GitHub token (Secrets Manager). Everything else the instance talks to (STS for the credential
-# check, SSM for the shell, the ECR API) goes out through NAT, because an endpoint each would cost
-# more per month than the plumbing is worth defending.
+# image layers in S3, so pulling the harness image uses it too. The one interface endpoint is the
+# one carrying content worth keeping off the public internet — the two secrets (the GH token and the
+# opencode key) come out of Secrets Manager. Everything else the instance talks to (STS for the
+# credential check, SSM for the shell, the ECR API, and the inference itself — opencode talks to its
+# own provider over HTTPS) goes out through NAT, because an endpoint each would cost more per month
+# than the plumbing is worth defending.
 
 resource "aws_vpc_endpoint" "s3" {
   vpc_id            = aws_vpc.main.id
@@ -158,19 +159,6 @@ resource "aws_vpc_endpoint" "s3" {
   route_table_ids   = [aws_route_table.private.id]
 
   tags = { Name = "${var.name}-s3" }
-}
-
-resource "aws_vpc_endpoint" "bedrock_runtime" {
-  count = var.bedrock_vpc_endpoint ? 1 : 0
-
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${var.region}.bedrock-runtime"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.private.id]
-  security_group_ids  = [aws_security_group.endpoints.id]
-  private_dns_enabled = true
-
-  tags = { Name = "${var.name}-bedrock-runtime" }
 }
 
 resource "aws_vpc_endpoint" "secretsmanager" {

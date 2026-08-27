@@ -19,7 +19,7 @@ resource "aws_instance" "loop" {
 
     # 2, not the default 1, and this is the step that silently breaks everything if it is missed:
     # Docker's bridge network adds a hop, so with a limit of 1 the container cannot reach IMDS at all
-    # and the Bedrock credentials simply never resolve. `--network host` avoids it instead.
+    # and the instance-role credentials never resolve. `--network host` avoids it instead.
     http_put_response_hop_limit = 2
   }
 
@@ -41,6 +41,7 @@ resource "aws_instance" "loop" {
     harness_repo         = var.harness_repo
     log_bucket           = aws_s3_bucket.logs.id
     gh_token_secret_name = var.gh_token_secret_name
+    opencode_secret_name  = var.opencode_secret_name
   })
 
   # Terraform infers dependencies from references, and the instance references neither the NAT gateway
@@ -91,7 +92,7 @@ resource "aws_instance" "retry" {
     http_endpoint = "enabled"
     http_tokens   = "required"
     # Docker's bridge network adds a hop; with the default limit of 1 the container cannot reach IMDS
-    # and the Bedrock credentials never resolve. The same trap as on the loop host.
+    # and the instance-role credentials never resolve. The same trap as on the loop host.
     http_put_response_hop_limit = 2
   }
 
@@ -113,6 +114,7 @@ resource "aws_instance" "retry" {
     harness_repo         = var.harness_repo
     log_bucket           = aws_s3_bucket.logs.id
     gh_token_secret_name = var.gh_token_secret_name
+    opencode_secret_name  = var.opencode_secret_name
   })
 
   depends_on = [
