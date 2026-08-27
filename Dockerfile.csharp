@@ -16,9 +16,11 @@ ARG UID=1000
 
 # apt over TLS, before the first apt-get. Same reasoning as the Go Dockerfile: the loop host only
 # allows outbound 443, so a plain http:// apt source hangs rather than fails. The dotnet SDK base is
-# Ubuntu (not Debian), so the rewrite targets its ports.ubuntu.com URI.
-RUN sed -i -E 's|https?://ports\.ubuntu\.com|https://ports.ubuntu.com|g' \
-      /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null; \
+# Ubuntu, and which mirror it uses depends on architecture — arm64 uses ports.ubuntu.com, amd64 uses
+# archive.ubuntu.com + security.ubuntu.com — so rewrite every http:// URI to https:// rather than
+# naming hosts.
+RUN sed -i -E 's|https?://([a-z0-9.-]+)/|https://\1/|g' \
+      /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null; \
     apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq ripgrep \
     && rm -rf /var/lib/apt/lists/*
