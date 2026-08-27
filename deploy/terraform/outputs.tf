@@ -32,3 +32,8 @@ output "create_gh_token_secret" {
   description = "Run this once, by hand, before the first push-enabled run. Terraform never sees the token."
   value       = "aws secretsmanager create-secret --region ${var.region} --name ${var.gh_token_secret_name} --secret-string 'github_pat_...'"
 }
+
+output "create_opencode_secret" {
+  description = "Run this once, by hand, before the first run. Terraform never sees the key."
+  value       = "aws secretsmanager create-secret --region ${var.region} --name ${var.opencode_secret_name} --secret-string 'opencode provider key for opencode-go'"
+}

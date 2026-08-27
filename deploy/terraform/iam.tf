@@ -7,7 +7,7 @@ data "aws_caller_identity" "current" {}
 
 resource "aws_iam_role" "loop" {
   name        = "${var.name}-loop"
-  description = "The ArchUnitDev loop: Bedrock inference, its own log prefix, its own secret."
+  description = "The ArchUnitDev loop: opencode inference, its own log prefix, its own secrets."
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -21,31 +21,10 @@ resource "aws_iam_role" "loop" {
   })
 }
 
-# The region is a wildcard on purpose: the pinned model is the *global* inference profile
-# `global.anthropic.claude-opus-5`, which may route across regions.
-resource "aws_iam_role_policy" "bedrock" {
-  name = "InvokeClaudeOnBedrock"
-  role = aws_iam_role.loop.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "InvokeClaudeOnBedrock"
-        Effect = "Allow"
-        Action = [
-          "bedrock:InvokeModel",
-          "bedrock:InvokeModelWithResponseStream",
-        ]
-        Resource = [
-          "arn:aws:bedrock:*::foundation-model/anthropic.*",
-          "arn:aws:bedrock:*:*:inference-profile/*anthropic.*",
-          "arn:aws:bedrock:*:*:application-inference-profile/*",
-        ]
-      },
-    ]
-  })
-}
+# Inference no longer goes through Bedrock: the harness drives opencode, which carries its own
+# provider auth. That key is a secret, fetched like the GH token and written into opencode's auth
+# file at boot. There is nothing for the instance role to do for inference itself.
+# (The old bedrock-invoke policy was removed with the Bedrock path.)
 
 # Write-only, and only under one prefix. Reading the logs back is something a human does from a laptop
 # with their own credentials, so the instance has no need of GetObject and does not get it.
@@ -130,6 +109,25 @@ resource "aws_iam_role_policy" "gh_token" {
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
         Resource = "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:${var.gh_token_secret_name}-*"
+      },
+    ]
+  })
+}
+
+# The opencode provider key, its own secret, readable by name only — the same shape as the GH token
+# above, and deliberately a separate secret from it: the two keys have different owners and different
+# blast radii, and mixing them would make rotating one a reason to touch the other.
+resource "aws_iam_role_policy" "opencode_key" {
+  name = "ReadOpencodeKey"
+  role = aws_iam_role.loop.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:${var.opencode_secret_name}-*"
       },
     ]
   })

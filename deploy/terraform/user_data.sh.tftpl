@@ -54,9 +54,30 @@ clone_private() {
     clone "$url" "$directory"
 }
 
-clone_private "${target_repo}" /home/ec2-user/ArchUnitGo
+clone_private "${target_repo}" /home/ec2-user/ArchUnitSharp
 clone_private "${harness_repo}" /home/ec2-user/ArchUnitDev
-unset GH_TOKEN
+
+# opencode's provider auth, materialised on the host so the container can bind-mount it, exactly like
+# the laptop run mounts ~/.local/share/opencode. The image runs opencode as uid 1001 with
+# HOME=/home/dev; the mounted path must be readable by that user. The key is fetched here (in the
+# same set +x window that guards GH_TOKEN, which is still unset at this point) and written into the
+# JSON shape opencode's auth store expects: {"<provider>": {"type": "api", "key": "<key>"}}.
+#
+# The provider name must match what MODEL/FLASH_MODEL name — the harness defaults to
+# opencode-go/deepseek-v4-flash, so the provider is "opencode-go".
+set +x
+OPENCODE_KEY="$(aws secretsmanager get-secret-value --region ${region} \
+  --secret-id ${opencode_secret_name} --query SecretString --output text 2>/dev/null || true)"
+if [ -n "$OPENCODE_KEY" ]; then
+  install -d -o ec2-user -g ec2-user /home/ec2-user/.local/share/opencode
+  printf '{"opencode-go": {"type": "api", "key": "%s"}}\n' "$OPENCODE_KEY" \
+    > /home/ec2-user/.local/share/opencode/auth.json
+  chown ec2-user:ec2-user /home/ec2-user/.local/share/opencode/auth.json
+  chmod 600 /home/ec2-user/.local/share/opencode/auth.json
+  echo "bootstrap: wrote the opencode auth file from ${opencode_secret_name}"
+fi
+unset OPENCODE_KEY
+set -x
 
 aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${registry}
 docker pull ${image} \
@@ -67,7 +88,9 @@ cat > /etc/profile.d/archunitdev.sh <<'PROFILE'
 export IMAGE="${image}"
 export S3_LOGS="s3://${log_bucket}/loop"
 export GH_TOKEN_SECRET="${gh_token_secret_name}"
-export REPO_DIR="/home/ec2-user/ArchUnitGo"
+export OPENCODE_SECRET="${opencode_secret_name}"
+export TARGET_LANG="csharp"
+export REPO_DIR="/home/ec2-user/ArchUnitSharp"
 export HARNESS_DIR="/home/ec2-user/ArchUnitDev"
 export LOGS_DIR="/home/ec2-user/logs"
 PROFILE

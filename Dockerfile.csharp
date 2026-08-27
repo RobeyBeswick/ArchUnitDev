@@ -1,0 +1,79 @@
+# Runner image for the ArchUnitDev loop against a C# target repo (TARGET_LANG=csharp).
+#
+# The sibling of Dockerfile (which drives Go targets) with the same properties:
+# deliberately non-root, the loop runs an unattended agent with full tool access against a mounted
+# repo, and a non-root user is the one thing bounding the damage a bad edit can do outside the mount.
+FROM mcr.microsoft.com/dotnet/sdk:10.0
+
+ARG GH_VERSION=2.65.0
+ARG TARGETARCH
+# UID 1000 to match ec2-user on the loop host: the target repo and logs are bind-mounted, a bind mount
+# carries the host's ownership straight through, and a dev user that is not 1000 cannot write files the
+# ec2-user-owned mounts give it. The dotnet SDK base image ships `ubuntu` on 1000 (and `app` on 1654),
+# so the ubuntu user is removed before dev is created. Local containers do not need this — colima
+# remaps host ownership — but the EC2 path is the point of this image.
+ARG UID=1000
+
+# apt over TLS, before the first apt-get. Same reasoning as the Go Dockerfile: the loop host only
+# allows outbound 443, so a plain http:// apt source hangs rather than fails. The dotnet SDK base is
+# Ubuntu (not Debian), so the rewrite targets its ports.ubuntu.com URI.
+RUN sed -i -E 's|https?://ports\.ubuntu\.com|https://ports.ubuntu.com|g' \
+      /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null; \
+    apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git jq ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN arch="${TARGETARCH:-amd64}" \
+    && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${arch}.tar.gz" \
+       | tar -xz -C /tmp \
+    && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" /usr/local/bin/gh \
+    && rm -rf /tmp/gh_*
+
+# `ubuntu` on the base image occupies uid 1000 (the id dev needs to match ec2-user on the host).
+# Removing it frees the id; nothing in the base image depends on the ubuntu user.
+RUN userdel -r ubuntu 2>/dev/null || true; useradd -m -u "${UID}" dev && mkdir -p /work && chown dev:dev /work
+USER dev
+ENV HOME=/home/dev
+
+RUN curl -fsSL https://opencode.ai/install | bash
+ENV PATH="/home/dev/.opencode/bin:${PATH}"
+
+# safe.directory matters: the target repo is bind-mounted and will not be owned by dev.
+# The identity is the owner's own; the email is what GitHub attributes commits by, so it must be a
+# verified address — the noreply form is the one guaranteed verified without publishing an inbox.
+# Same identity as the Go image.
+RUN git config --global user.name  "Robey Beswick" \
+ && git config --global user.email "88316323+RobeyBeswick@users.noreply.github.com" \
+ && git config --global --add safe.directory /work/repo
+
+# NUGET_PACKAGES moves under $HOME so the package cache is writable by dev and survives as its own
+# layer rather than being root-owned under the image default.
+ENV NUGET_PACKAGES=/home/dev/.nuget/packages
+
+# Warm the NuGet cache for the packages the target repo's test projects take — xunit and the test
+# SDK, plus the win-x64 runtime pack the gate's cross-RID publish restores. Worth it for the same
+# reason the Go image warms its module cache: otherwise every fresh container fetches these inside
+# the implementer's wall clock on the first gate run, and on a network where the feed is unreachable
+# it cannot fetch them at all.
+#
+# The versions are cache keys, not constraints. If the target repo resolves different ones, dotnet
+# fetches those and this layer goes unused — a stale value here is harmless, never wrong.
+#
+# The win-x64 RuntimeIdentifier is what pulls the runtime pack the gate needs for
+# `dotnet publish -r win-x64`; restoring a project that declares it populates that pack.
+RUN mkdir -p /tmp/warm && cd /tmp/warm \
+    && dotnet new classlib -n Warm -o . --no-restore >/dev/null \
+    && dotnet add package Microsoft.NET.Test.Sdk --version 17.11.1 >/dev/null \
+    && dotnet add package xunit --version 2.9.2 >/dev/null \
+    && dotnet add package xunit.runner.visualstudio --version 2.8.2 >/dev/null \
+    && sed -i 's#</Project>#  <PropertyGroup><RuntimeIdentifier>win-x64</RuntimeIdentifier></PropertyGroup>\n</Project>#' Warm.csproj \
+    && dotnet restore -r win-x64 \
+    && cd / && rm -rf /tmp/warm
+
+COPY --chown=dev:dev . /harness
+WORKDIR /harness
+
+ENV REPO=/work/repo \
+    LOGS=/work/logs
+
+ENTRYPOINT ["/harness/run.sh"]
