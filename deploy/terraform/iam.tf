@@ -7,7 +7,7 @@ data "aws_caller_identity" "current" {}
 
 resource "aws_iam_role" "loop" {
   name        = "${var.name}-loop"
-  description = "The ArchUnitDev loop: opencode inference, its own log prefix, its own secrets."
+  description = "The ArchUnitDev loop: Bedrock inference, its own log prefix, its own secret."
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -21,10 +21,34 @@ resource "aws_iam_role" "loop" {
   })
 }
 
-# Inference no longer goes through Bedrock: the harness drives opencode, which carries its own
-# provider auth. That key is a secret, fetched like the GH token and written into opencode's auth
-# file at boot. There is nothing for the instance role to do for inference itself.
-# (The old bedrock-invoke policy was removed with the Bedrock path.)
+# Inference goes through opencode, and opencode has two ways to reach a model. A provider key
+# (opencode-go and friends) is a secret, fetched like the GH token and written into opencode's auth
+# file at boot. Bedrock (`MODEL=amazon-bedrock/...`) needs no key at all: opencode's Bedrock provider
+# uses the AWS SDK's default chain, which resolves the instance role through IMDS — so this policy is
+# the whole of the Bedrock path, and the same statement as deploy/bedrock-invoke-policy.json.
+resource "aws_iam_role_policy" "bedrock" {
+  name = "InvokeClaudeOnBedrock"
+  role = aws_iam_role.loop.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "InvokeClaudeOnBedrock"
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream",
+        ]
+        Resource = [
+          "arn:aws:bedrock:*::foundation-model/anthropic.*",
+          "arn:aws:bedrock:*:*:inference-profile/*anthropic.*",
+          "arn:aws:bedrock:*:*:application-inference-profile/*",
+        ]
+      },
+    ]
+  })
+}
 
 # Write-only, and only under one prefix. Reading the logs back is something a human does from a laptop
 # with their own credentials, so the instance has no need of GetObject and does not get it.

@@ -41,7 +41,7 @@ resource "aws_instance" "loop" {
     harness_repo         = var.harness_repo
     log_bucket           = aws_s3_bucket.logs.id
     gh_token_secret_name = var.gh_token_secret_name
-    opencode_secret_name  = var.opencode_secret_name
+    opencode_secret_name = var.opencode_secret_name
   })
 
   # Terraform infers dependencies from references, and the instance references neither the NAT gateway
@@ -114,7 +114,7 @@ resource "aws_instance" "retry" {
     harness_repo         = var.harness_repo
     log_bucket           = aws_s3_bucket.logs.id
     gh_token_secret_name = var.gh_token_secret_name
-    opencode_secret_name  = var.opencode_secret_name
+    opencode_secret_name = var.opencode_secret_name
   })
 
   depends_on = [

@@ -161,6 +161,19 @@ resource "aws_vpc_endpoint" "s3" {
   tags = { Name = "${var.name}-s3" }
 }
 
+resource "aws_vpc_endpoint" "bedrock_runtime" {
+  count = var.bedrock_vpc_endpoint ? 1 : 0
+
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${var.region}.bedrock-runtime"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.private.id]
+  security_group_ids  = [aws_security_group.endpoints.id]
+  private_dns_enabled = true
+
+  tags = { Name = "${var.name}-bedrock-runtime" }
+}
+
 resource "aws_vpc_endpoint" "secretsmanager" {
   count = var.secretsmanager_vpc_endpoint ? 1 : 0
 

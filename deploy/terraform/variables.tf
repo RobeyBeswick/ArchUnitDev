@@ -126,3 +126,13 @@ variable "secretsmanager_vpc_endpoint" {
   type        = bool
   default     = true
 }
+
+variable "bedrock_vpc_endpoint" {
+  description = <<-EOT
+    Send Bedrock inference (MODEL=amazon-bedrock/...) through a PrivateLink endpoint instead of out
+    through the NAT gateway, so the diffs and prompts never traverse the public internet. ~$7/month.
+    Unused, and safe to turn off, when the loop runs on an opencode provider key instead.
+  EOT
+  type        = bool
+  default     = true
+}
