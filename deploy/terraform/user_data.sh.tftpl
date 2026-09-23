@@ -83,6 +83,17 @@ aws ecr get-login-password --region ${region} | docker login --username AWS --pa
 docker pull ${image} \
   || echo "bootstrap: ${image} is not in the registry yet. Build it from ~/ArchUnitDev and tag it."
 
+# Bedrock credentials for the container. opencode's Bedrock provider does not fall back to IMDS on its
+# own: with no AWS_* variable set it fails with "AWS access key ID setting is missing" even though the
+# instance role is right there — and PREFLIGHT_ONLY never calls a model, so it passes regardless. A
+# profile whose credential_source is the instance metadata gives the SDK chain its entry point and is
+# still the instance role: short-lived, refreshed, no key on disk. Found on the first ArchUnitSharpTest
+# run, where the only symptom was every implement exiting rc=1 in seconds.
+install -d -o ec2-user -g ec2-user /home/ec2-user/.aws-loop
+printf '[profile loop]\ncredential_source = Ec2InstanceMetadata\nregion = ${region}\n' \
+  > /home/ec2-user/.aws-loop/config
+chown ec2-user:ec2-user /home/ec2-user/.aws-loop/config
+
 # The values the operator's commands need, so none of them has to be typed from memory at 22:00.
 cat > /etc/profile.d/archunitdev.sh <<'PROFILE'
 export IMAGE="${image}"
@@ -93,6 +104,9 @@ export TARGET_LANG="csharp"
 export REPO_DIR="/home/ec2-user/ArchUnitSharp"
 export HARNESS_DIR="/home/ec2-user/ArchUnitDev"
 export LOGS_DIR="/home/ec2-user/logs"
+export AWS_REGION="${region}"
+# Spliced unquoted into every `docker run` in deploy/README.md; see the .aws-loop comment above.
+export BEDROCK_ARGS="-e AWS_REGION -e AWS_PROFILE=loop -e AWS_CONFIG_FILE=/home/dev/.aws-loop/config -v /home/ec2-user/.aws-loop:/home/dev/.aws-loop:ro"
 PROFILE
 chmod 0644 /etc/profile.d/archunitdev.sh
 

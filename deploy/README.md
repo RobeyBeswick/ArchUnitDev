@@ -144,37 +144,36 @@ the token: with `GH_TOKEN` stripped, `gh` cannot authenticate, so the helper ans
 
 ## 5. Check before committing to a night
 
+For a Bedrock run, set the model and splice in `$BEDROCK_ARGS` (from `/etc/profile.d/archunitdev.sh`)
+on every `docker run` — unquoted, because it is several arguments:
+
 ```bash
-docker run --rm -e GH_TOKEN -e PREFLIGHT_ONLY=1 \
+export MODEL=amazon-bedrock/us.anthropic.claude-opus-5-5 FLASH_MODEL=amazon-bedrock/us.anthropic.claude-opus-5-5
+docker run --rm -e GH_TOKEN -e PREFLIGHT_ONLY=1 -e TARGET_LANG -e MODEL -e FLASH_MODEL $BEDROCK_ARGS \
   -v "$REPO_DIR:/work/repo" -v "$LOGS_DIR:/work/logs" "$IMAGE"
 ```
 
-Costs nothing. You want `auth: Bedrock in us-east-1 as arn:aws:sts::…:assumed-role/archunitdev-loop/…`
-and **no** static-credentials warning. Seeing `assumed-role/archunitdev-loop` is the proof that the
-instance profile — not a leftover environment variable — is what answered.
-
-It is *not* proof that inference works: that line comes from `sts get-caller-identity`, which resolves
-credentials without calling Bedrock at all. The one assumption in this stack worth proving rather than
-trusting is whether a regional PrivateLink endpoint can serve a *global* inference profile — the pinned
-model is `global.anthropic.claude-opus-5`, which routes across regions server-side. One real call
-settles it, for a fraction of a cent:
+Costs nothing, and proves nothing about inference: preflight never calls a model. `$BEDROCK_ARGS`
+exists because opencode's Bedrock provider does not reach the instance role through IMDS on its own —
+without it every invocation fails in seconds with "AWS access key ID setting is missing", and preflight
+still passes. The first ArchUnitSharpTest launch abandoned two issues that way. One real call, inside
+the image with the same arguments the loop gets, settles it for a fraction of a cent:
 
 ```bash
-docker run --rm --entrypoint bash archunitdev -lc \
-  'getent hosts bedrock-runtime.us-east-1.amazonaws.com; \
-   claude --model global.anthropic.claude-opus-5 -p "Reply with exactly: OK"'
+docker run --rm $BEDROCK_ARGS --entrypoint bash "$IMAGE" -lc \
+  "getent hosts bedrock-runtime.$AWS_REGION.amazonaws.com; \
+   opencode run --format json --model $MODEL 'Reply with exactly: OK' | tail -1"
 ```
 
-A `10.0.1.x` address for the hostname means DNS is resolving to the interface endpoint inside the
-private subnet rather than to a public one, and a reply after it means the global profile is served
-through it. Both hold as of 2026-08-14. If inference fails here but works with
-`bedrock_vpc_endpoint = false`, that is the assumption breaking.
+A `10.0.1.x` address for the hostname means DNS is resolving to the PrivateLink endpoint inside the
+private subnet, and a `step_finish` line with a non-zero `cost` means the call was served and priced —
+the same `cost` the spend accounting sums. Both held for `us.anthropic.claude-opus-5-5` on 2026-09-23.
 
 ## 6. Run it
 
 ```bash
 nohup docker run --rm \
-  -e GH_TOKEN -e NO_PUSH=1 -e MAX_ISSUES=5 \
+  -e GH_TOKEN -e NO_PUSH=1 -e MAX_ISSUES=5 -e TARGET_LANG -e MODEL -e FLASH_MODEL $BEDROCK_ARGS \
   -v "$REPO_DIR:/work/repo" \
   -v "$LOGS_DIR:/work/logs" \
   "$IMAGE" > "$LOGS_DIR/loop.out" 2>&1 &
