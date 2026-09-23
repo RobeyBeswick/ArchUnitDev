@@ -1,0 +1,11 @@
+{
+  "note": "The single EC2 host of the deepseek-v4-flash build, eu-central-1, for the whole window it was provisioned: launched 2026-08-27T13:44:04Z, stopped 2026-09-01T21:21:14Z (user-initiated). Rates are published on-demand prices; data processing is not itemised.",
+  "hours": 127.62,
+  "rows": [
+    {"resource": "EC2 instance", "detail": "t3.large (2 vCPU / 8 GiB), AL2023", "count": 1, "rate": 0.096, "unit": "hr"},
+    {"resource": "EBS root volume", "detail": "30 GB gp3, encrypted", "count": 30, "rate": 0.08, "unit": "GB-Mo"},
+    {"resource": "NAT gateway", "detail": "1, one AZ", "count": 1, "rate": 0.052, "unit": "hr"},
+    {"resource": "Secrets Manager interface endpoint", "detail": "1 AZ", "count": 1, "rate": 0.012, "unit": "hr"},
+    {"resource": "Public IPv4 (NAT gateway)", "detail": "in use", "count": 1, "rate": 0.005, "unit": "hr"}
+  ]
+}
