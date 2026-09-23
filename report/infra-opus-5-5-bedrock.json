@@ -1,0 +1,11 @@
+{
+  "note": "Both EC2 hosts of the Opus 5.5 benchmark, us-east-1, for the run window (first to last run.log timestamp). The second host is a standby and runs no issues, but it is up for the whole run and is counted. Rates are from the AWS Price List API (us-east-1 on-demand), fetched 2026-09-23. NAT and endpoint data processing ($0.045/GB and $0.01/GB) are not itemised here; the Cost Explorer cross-check covers them.",
+  "hours": null,
+  "rows": [
+    {"resource": "EC2 instances", "detail": "2 x m5.xlarge (4 vCPU / 16 GiB), AL2023; one runs the loop, one on standby", "count": 2, "rate": 0.192, "unit": "hr"},
+    {"resource": "EBS root volumes", "detail": "2 x 30 GB gp3, encrypted", "count": 60, "rate": 0.08, "unit": "GB-Mo"},
+    {"resource": "NAT gateway", "detail": "1, one AZ", "count": 1, "rate": 0.045, "unit": "hr"},
+    {"resource": "Interface VPC endpoints", "detail": "bedrock-runtime and secretsmanager, one AZ each", "count": 2, "rate": 0.01, "unit": "hr"},
+    {"resource": "Public IPv4 (NAT gateway)", "detail": "in use", "count": 1, "rate": 0.005, "unit": "hr"}
+  ]
+}
