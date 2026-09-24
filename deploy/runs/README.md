@@ -139,3 +139,98 @@ keeping. See the comment on `aws_iam_role_policy.handoff`.
   the warning comes from the directory walk, before filters apply. Fixed with `--no-follow-symlinks`
   (exit 2 → 0, measured on the host). A fresh host never sees it: with no `latest` yet the fatal first
   sync succeeds, and every later failure lands in the warn-and-continue path.
+
+## The 24 September brute force: ArchUnitSharpTest `#38` and `#39` on Opus 5.5
+
+Script: `sharp-opus55-bruteforce.sh`. This follows on from the Opus 5.5 benchmark run
+(`RUN_ID sharp-opus55-20260923T103101Z`), which ran at the benchmark settings: `MAX_ROUNDS=3 TIMEOUT=60m
+VARIANT=high MAX_CONSECUTIVE_ABANDONS=2 RETRY_ABANDONED=1`, with no spend cap.
+
+### What the benchmark left
+
+Between 2026-09-23 10:30Z and 2026-09-24 01:33Z it landed `#1`-`#37` on a $286.96 ledger. It then
+abandoned `#38` (pattern exclusions, `except`) and `#39` (logging) back to back, which tripped the
+two-abandon breaker. `#40`-`#46` were never attempted; `#44` was held back from the start.
+
+The breaker was wrong this time. What it guards against, a broken environment, was not there: the gate
+was clean in every round of both issues, and every round's findings were new and real. On `#38` they
+were a doc example the folder rules contradict, and tests that cannot tell the sibling matcher apart.
+On `#39` they were a `Release(fullPath)` in a `catch` whose deletion no test catches, and doc remarks
+claiming file sharing that `FileShare.Read` does not give. Both issues were converging when they ran
+out of runway, which is the `#30`/`#31` pattern from 15 August. And because the breaker calls `die()`,
+the `RETRY_ABANDONED` phase that would have given each issue a second attempt never ran, as it did not
+on 15 August either.
+
+### What was changed, and what deliberately was not
+
+The extra power is **attempts, rounds and time**. Nothing else changes:
+
+| | benchmark | brute force (phase A: `#38`, then `#39`) |
+|---|---|---|
+| attempts per issue | 1 (plus a retry that never ran) | up to 5, each a fresh `run.sh` |
+| `MAX_ROUNDS` | 3 | 15 |
+| `TIMEOUT` (per invocation) | 60m | 240m |
+| `CARRY_FINDINGS` | off | on: each attempt starts from the last one's outstanding findings |
+| `MAX_CONSECUTIVE_ABANDONS` | 2 | 0 |
+| model, `VARIANT`, prompts, gate, critics | Opus 5.5, `high` | **unchanged** |
+
+The model, the reasoning effort, the prompts and the approval bar are all unchanged. An issue still lands
+only on a unanimous PASS over a clean gate. So if either issue lands, the only difference from the
+benchmark is how long the loop was allowed to try, and that is the thing being measured.
+
+`VARIANT=max` was tried first and dropped. Its first implement died three seconds in (see below), and
+raising reasoning effort would make the model on these two issues a different one from the model on
+the other 37. Everything stays on `high`.
+
+Phase B then runs `#40`-`#46` at exactly the benchmark's settings, in the benchmark's own log
+directory, so the report reads one ledger. There are two deviations, both small:
+
+- `MAX_CONSECUTIVE_ABANDONS=0`. The breaker has already fired once on hard issues, and a second false
+  stop costs another night.
+- `#38` and `#39` are held back if phase A did not land them, since they have had their attempts.
+
+### How the attempts are kept apart
+
+Every attempt is its own `run.sh` invocation with its own log directory,
+`logs/bruteforce/<N>-attempt-<k>/`. `run.sh` names its files by issue, role and round, so a second run
+over the same directory would overwrite the first attempt's `.json`/`.jsonl` files, and their token
+data would be gone for good. An attempt's `skipped` holds every other open issue, which is how a single
+run is pointed at exactly one issue. An abandoned attempt's branch is renamed
+`abandoned/issue-<N>-bruteforce-<k>` and pushed before the next attempt reuses the name. The
+benchmark's `abandoned/issue-<N>` is left as it was.
+
+### The crash that is not an attempt
+
+In each of the first three launches, the first implement in a fresh container exited `rc=1` three
+seconds in:
+
+- opencode reported `"Unexpected server error. Check server logs for details."`
+- the cost was $0 and there were no turns
+- opencode's own log shows the session created and its event stream connected, then nothing, not even
+  step 0
+
+`run.sh` then did what it should do with an empty diff. It abandoned the issue and posted "could not
+get this past review in 15 rounds" on it, although no model had looked at the issue. The next
+invocation in the same container ran normally.
+
+The same prompt, sent to a fresh `--rm` container outside the loop, also worked, so the cause is still
+open. The script does not count this as an attempt. When an implement fails with exactly that
+signature (`cost=$0 turns=0`, then "the implementer changed nothing on round 1"), the script:
+
+- sets the directory aside as `crashed-<N>-attempt-<k>-<i>`
+- deletes the comment the non-attempt posted
+- runs the attempt again, giving up after three crashes in a row
+
+On the launch of 2026-09-24 11:58Z the first implement crashed exactly as before. The crash was
+caught, and the re-run implement was at $2.12 and 80 events six minutes later.
+
+The other directories under `logs/bruteforce/` are the aborted launches, kept for the record:
+`aborted-variant-max-38-attempt-1` (the `max` launch), `crashed-38-attempt-1-launch2`, and
+`aborted-stopped-38-attempt-2-launch2`. The last one was stopped by hand while its launch was being
+diagnosed, before the crash handling existed. None of them landed any code or parked a branch, and
+their ledgers are $0 apart from the few minutes of the stopped attempt.
+
+### Results
+
+To be filled in when the run finishes: which attempt, if any, landed each of `#38` and `#39`, the
+rounds and cost per attempt, and phase B's outcome.
