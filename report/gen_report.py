@@ -6,7 +6,9 @@ Aggregates per-issue and per-invocation cost + token data from the loop's
 to S3). Reads any mix of:
 
   * local bring-up runs (--local-logs; optional — an EC2-only run has none)
-  * an EC2 log dir synced from S3 (--s3-logs)
+  * an EC2 log dir synced from S3 (--s3-logs), plus any further EC2 dirs after a comma — a
+    relaunch that wrote to its own directory so as not to overwrite the first run's tags (the
+    ArchUnitSharpTest brute force of #38/#39 kept each attempt in logs/bruteforce/<N>-attempt-<k>/)
 
 Everything that differs between runs is read from the logs or passed in, not
 written into this script: the model and variant come from run.log, the
@@ -49,6 +51,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
 
 TS_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s")
+ROUNDS_RE = re.compile(r"variant \S+, (\d+) rounds/issue, (\S+) per invocation")
 MODEL_RE = re.compile(r"model (\S+) \(implement/critics\), (\S+) \(fix/retro\), variant (\S+),")
 LEDGER_RE = re.compile(r"^\S+\s+(\d+)-([a-z0-9-]+): .*cost=\$([0-9.]+)")
 ABANDON_RE = re.compile(r"#(\d+) ABANDONED")
@@ -132,7 +135,7 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--local-logs", help="comma-separated local log dirs (optional)")
-    ap.add_argument("--s3-logs", help="EC2/S3 log dir (run.log + *.json/jsonl)")
+    ap.add_argument("--s3-logs", help="EC2/S3 log dir (run.log + *.json/jsonl); comma-separate further EC2 dirs of the same build")
     ap.add_argument("--s3-uri", help="the S3 prefix the dir was synced from, for the report's source list")
     ap.add_argument("--out", help="output markdown path")
     ap.add_argument("--repo", help="GitHub repo (default RobeyBeswick/ArchUnitSharp)")
@@ -144,22 +147,27 @@ def main():
 
     LOCAL_DIRS = a.local_logs.split(",") if a.local_logs else env_list("LOCAL_LOGS", "")
     LOCAL_DIRS = [d for d in LOCAL_DIRS if os.path.isdir(d)]
-    S3_DIR = a.s3_logs or os.environ.get("S3_LOGS") or os.path.join(REPO_ROOT, "s3logs")
+    S3_DIRS = [d for d in (a.s3_logs or os.environ.get("S3_LOGS") or os.path.join(REPO_ROOT, "s3logs")).split(",") if d]
+    S3_DIR = S3_DIRS[0]
     OUT = a.out or os.environ.get("OUT") or os.path.join(REPO_ROOT, "ArchUnitSharp-build-report.md")
     REPO = a.repo or os.environ.get("TARGET_REPO") or "RobeyBeswick/ArchUnitSharp"
-    if not os.path.isdir(S3_DIR):
-        sys.exit(f"S3 log dir not found: {S3_DIR}; pass --s3-logs (e.g. an `aws s3 sync` of a /loop/<RUN_ID> prefix)")
-    ALL_DIRS = LOCAL_DIRS + [S3_DIR]
+    for d in S3_DIRS:
+        if not os.path.isdir(d):
+            sys.exit(f"S3 log dir not found: {d}; pass --s3-logs (e.g. an `aws s3 sync` of a /loop/<RUN_ID> prefix)")
+    ALL_DIRS = LOCAL_DIRS + S3_DIRS
     # Labels, never paths: the report is committed to a public repository, and an absolute path
     # carries a username.
     def label(d):
-        return "s3logs" if d == S3_DIR else os.path.basename(d.rstrip("/"))
+        if d == S3_DIR:
+            return "s3logs"
+        rel = os.path.relpath(d, S3_DIR)
+        return rel if d in S3_DIRS and not rel.startswith("..") else os.path.basename(d.rstrip("/"))
     s3_label = a.s3_uri or "an S3 `/loop/<RUN_ID>` prefix"
 
     gh = fetch_issue_metadata(REPO)
 
     # ---- narration: models, window, attempts, abandonments, landings, held-back ----
-    models, stamps = [], []
+    models, stamps, budgets = [], [], []
     abandoned = defaultdict(int)
     retry_landed, pushed, started = set(), {}, set()
     failed_closed = 0
@@ -171,6 +179,9 @@ def main():
             m = MODEL_RE.search(line)
             if m and m.groups() not in models:
                 models.append(m.groups())
+            m = ROUNDS_RE.search(line)
+            if m and m.groups() not in budgets:
+                budgets.append(m.groups())
             for rx, fn in ((ABANDON_RE, lambda n: abandoned.__setitem__(n, abandoned[n] + 1)),
                            (RETRY_LANDED_RE, retry_landed.add),
                            (START_RE, started.add)):
@@ -195,7 +206,7 @@ def main():
     # authoritative EC2 cost ledger from run.log (all attempts, incl. overwritten re-attempts)
     ledger = defaultdict(float)
     ledger_inv = ledger_impl = 0
-    for line in narration(S3_DIR):
+    for line in (l for d in S3_DIRS for l in narration(d)):
         m = LEDGER_RE.match(line.strip())
         if m:
             ledger[int(m.group(1))] += float(m.group(3))
@@ -371,7 +382,9 @@ def main():
     A("")
     A(f"- **Target:** [`{REPO}`](https://github.com/{REPO}) — built issue-by-issue by the ArchUnitDev loop.")
     A(f"- **Model:** {model_line}")
-    A("- **Loop mechanics per issue:** implement → deterministic gate → three read-only critics (review / tests / idiom; tests runs twice and the passes are unioned) → fix round; up to 3 fix rounds, then abandon, with one re-attempt on the batch's final tree.")
+    budget = (" / ".join(f"{r} rounds and {t} per invocation" for r, t in budgets)
+              + (" (different runs merged here)" if len(budgets) > 1 else "")) if budgets else "a round budget not recorded in the narration"
+    A(f"- **Loop mechanics per issue:** implement → deterministic gate → three read-only critics (review / tests / idiom; tests runs twice and the passes are unioned) → fix round; {budget}, then abandon.")
     A(f"- **Window:** {when(run_start)} → {when(run_end)} ({run_hours:.2f} h), first to last timestamp in the narration.")
     A("- **Cost granularity:** every model invocation has a `total_cost_usd` (sum of per-step `step_finish.cost`, which opencode prices from its own model table). Every step's token counts (`input`, `output`, `reasoning`, `cache.read`, `cache.write`) are recorded in the raw `.jsonl`.")
     A("- **Currency:** USD. **Model spend only** in the headline; AWS infrastructure is itemised in §6 and the bill cross-checked in §8.")
@@ -532,6 +545,15 @@ def main():
                     A(f"| {svc} | ${f2(v)} |")
             A(f"| **Total** | **${f2(sum(by.values()))}** |")
             A("")
+            # The Opus 5.5 report's first generation printed $2.74 of unrelated services here, a day after
+            # the run, with neither the EC2 hosts nor Bedrock posted yet: a partial bill reads like a
+            # complete one unless the report says which lines it is still waiting for.
+            missing = [what for what, keys in (("EC2 compute", ("Elastic Compute Cloud",)),
+                                               ("the model", ("Bedrock", "Claude", "Anthropic")))
+                       if not any(k in svc and v >= 0.005 for svc, v in by.items() for k in keys)]
+            if missing:
+                A(f"> **Incomplete: no line yet for {' or '.join(missing)}.** Cost Explorer has not posted those charges for these days, so this total is the account's other services only, not the run's bill. Regenerate once they appear.")
+                A("")
     if not did:
         A("Not run: pass `--cloudwatch-model <bedrock model id>` and/or `--cost-explorer` (Bedrock runs only; needs AWS credentials for the account).")
         A("")
@@ -563,6 +585,8 @@ def main():
     if LOCAL_DIRS:
         A(f"- Local bring-up logs: {', '.join('`'+label(d)+'`' for d in LOCAL_DIRS)}")
     A(f"- EC2 logs: {s3_label}")
+    for d in S3_DIRS[1:]:
+        A(f"- Further EC2 logs of the same build: `{label(d)}`")
     A("- The per-invocation CSV (issue, tag, role, round, retry, source, cost, turns, reason, verdict, findings, in/out/reasoning/cache tokens) is regenerable from the same data.")
     A("")
     A("---")
