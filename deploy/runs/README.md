@@ -232,5 +232,45 @@ their ledgers are $0 apart from the few minutes of the stopped attempt.
 
 ### Results
 
-To be filled in when the run finishes: which attempt, if any, landed each of `#38` and `#39`, the
-rounds and cost per attempt, and phase B's outcome.
+Both issues landed on their first brute-force attempt. Neither needed more than 2 of the 15 rounds,
+and no invocation came near the 240m timeout. Then phase B cleared the rest of the backlog without an
+abandonment. The container exited cleanly at 2026-09-24 15:19:54Z, 3h21m after launch. `#44` (Publish
+to NuGet) is the only open issue, and it was held back on purpose.
+
+| issue | attempt | rounds | implement | issue total |
+|---|---|---|---|---|
+| `#38` pattern exclusions | 1 of 5 | 2: tests FAIL, then all PASS | $8.66, 78 turns | $13.73 |
+| `#39` logging | 1 of 5 | 2: tests FAIL, then all PASS | $11.09, 125 turns | $17.21 |
+
+Phase B ran at the benchmark's settings (3 rounds, 60m):
+
+| issue | rounds | issue total |
+|---|---|---|
+| `#40` dogfood the architecture rules | 2 | $5.63 |
+| `#41` README | 1 | $5.40 |
+| `#42` documentation site | 3 | $13.86 |
+| `#43` CI | 1 | $1.29 |
+| `#45` test suite green across the CI matrix | 1 | $0.72 |
+| `#46` `Metrics<T>()` silent pass | 1 | $1.90 |
+| **phase B** | | **$28.80** |
+
+The CI on the final tip (`fa896d9`) passes: "Build, lint and test" and "Build the site" both succeed,
+and "Publish to GitHub Pages" is skipped.
+
+What the whole backlog cost:
+
+| | cost |
+|---|---|
+| benchmark (`#1`-`#37`, and the abandoned first attempts at `#38`/`#39`) | $286.96 |
+| brute force `#38` + `#39` | $30.94 |
+| aborted and crashed launches | $0.15 |
+| phase B (`#40`-`#43`, `#45`, `#46`) | $28.80 |
+| **45 of 46 issues landed** | **$346.85** |
+
+What this says about the benchmark's two abandonments: they were a runway problem, not a capability
+problem. Each issue needed one more round than `MAX_ROUNDS=3` allowed it. `CARRY_FINDINGS` mattered
+here: the re-implementation started from the findings the benchmark's third round had left
+outstanding, so it did not rediscover them. On the second attempt, the $30.94 it took to land both issues
+was about one tenth of the benchmark's total, while 15 rounds and 240m, which cost nothing unless
+used, went almost entirely unused. The breaker was the part that was wrong. With it off and a retry
+available, the benchmark settings alone would most likely have landed both issues in the same night.
