@@ -45,6 +45,33 @@ to merge in), `--s3-logs`/`S3_LOGS`, `--out`/`OUT`, `--repo`/`TARGET_REPO`.
 `--s3-uri` is only a label for the sources section; shorten the bucket name in
 anything you commit.
 
+`--s3-logs` takes a comma-separated list when one build's logs are split across
+directories — the Opus 5.5 build's brute-force attempts each ran as their own
+`run.sh` with their own log directory:
+
+```bash
+D=./s3logs
+python3 report/gen_report.py --s3-logs "$D,$D/bruteforce/38-attempt-1,$D/bruteforce/39-attempt-1" …
+```
+
+The first directory is the primary one; the others are labelled relative to it,
+and the ledger is the sum of every directory's `run.log`.
+
+## Comparing two builds
+
+`compare_reports.py` reads the grand-totals and per-issue tables of two reports
+of the same backlog and prints markdown tables side by side: the totals with
+their ratio, the rounds each issue took to land, and every issue's cost in both
+builds. It reads reports rather than logs, because the report is the one
+artefact both builds have.
+
+```bash
+python3 report/compare_reports.py ArchUnitSharp-build-report.md ArchUnitSharpTest-opus-5-5-report.md \
+    --labels deepseek-v4-flash "Opus 5.5"
+```
+
+`ArchUnitSharp-deepseek-v4-flash-vs-opus-5-5.md` puts those tables inside the written comparison.
+
 The S3 logs are the source of truth for cost: `run.log` is the ledger, and the
 `.jsonl` files carry the tokens. The AWS cross-checks use the ambient
 credentials (`AWS_PROFILE`), bound every call with `--cli-read-timeout 60`, and
